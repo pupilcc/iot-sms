@@ -10,6 +10,7 @@
 #include "sdkconfig.h"
 
 #include "mqtt_manager.h"
+#include "uart_at_manager.h" // 包含此头文件以访问全局变量 g_sim_operator 和 g_sim_phone_number
 
 static const char *TAG = "mqtt_manager";
 
@@ -109,9 +110,22 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
         return ESP_FAIL;
     }
 
-    char payload[sizeof(sms->sender) + sizeof(sms->content) + 32]; // +32 for JSON overhead
-    // Example JSON format: {"sender": "+8613800000000", "content": "Hello World"}
-    snprintf(payload, sizeof(payload), "{\"sender\":\"%s\",\"content\":\"%s\"}", sms->sender, sms->content);
+    // 计算新的JSON payload所需的缓冲区大小
+    // 格式示例: {"sender":"%s","content":"%s","operator":"%s","device_number":"%s"}
+    // 最大长度估算: sender (20), content (256), operator (32), device_number (20)
+    // 加上固定的JSON字符 (引号, 逗号, 冒号, 大括号) 和 null 终止符
+    // 大致: 20 + 256 + 32 + 20 + (固定JSON开销 ~ 60) = ~388 字节
+    // 使用一个足够大的缓冲区，例如 512 字节。
+    char payload[512]; 
+    
+    // 检查运营商和本机号码是否可用，如果为空则使用"UNKNOWN"
+    const char *operator_str = (strlen(g_sim_operator) > 0) ? g_sim_operator : "UNKNOWN";
+
+    // 构建包含运营商和本机号码的JSON payload
+    // 示例 JSON 格式: {"sender": "+8613800000000", "content": "Hello World", "operator": "中国移动"}
+    snprintf(payload, sizeof(payload), 
+             "{\"sender\":\"%s\",\"content\":\"%s\",\"operator\":\"%s\"}", 
+             sms->sender, sms->content, operator_str);
 
     int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_SMS, payload, 0, 1, 0);
     if (msg_id == -1) {

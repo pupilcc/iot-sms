@@ -37,12 +37,45 @@ static EventGroupHandle_t s_at_response_event_group;
 #define AT_RESPONSE_ERROR_BIT BIT1
 #define AT_RESPONSE_URC_BIT   BIT2 // For unsolicited result codes like +CMT
 
+// 全局变量定义和初始化
+char g_sim_operator[32] = {0};
+
 // Forward declarations
 static int handle_urc(char *urc_line_buffer);
 static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t buffer_size, TickType_t timeout_ticks);
 static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_t *sms_msg);
-// Add this forward declaration for decode_ucs2_hex_to_utf8
 static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, size_t utf8_buf_len);
+
+// 新增的获取SIM卡信息的辅助函数
+static esp_err_t get_sim_imsi(char *imsi_buffer, size_t buffer_size);
+static esp_err_t get_sim_operator_name(char *operator_buffer, size_t buffer_size);
+
+// IMSI到运营商的映射表 (参考Lua脚本)
+typedef struct {
+    const char *mcc_mnc_prefix;
+    const char *operator_name_zh;
+} sim_operator_map_t;
+
+static const sim_operator_map_t s_operator_map[] = {
+    {"46000", "中国移动"},
+    {"46002", "中国移动"},
+    {"46007", "中国移动"},
+    {"46008", "中国移动"},
+    {"46001", "中国联通"},
+    {"46006", "中国联通"},
+    {"46009", "中国联通"},
+    {"46010", "中国联通"},
+    {"46003", "中国电信"},
+    {"46005", "中国电信"},
+    {"46011", "中国电信"},
+    {"46012", "中国电信"},
+    {"46015", "中国广电"},
+    // 可以根据需要添加其他运营商
+    {"23410", "Giffgaff"},
+    {"53005", "Skinny"},
+};
+static const size_t s_operator_map_size = sizeof(s_operator_map) / sizeof(s_operator_map[0]);
+
 
 // UART event handler to collect data
 static void uart_event_task(void *pvParameters) {
@@ -300,6 +333,67 @@ esp_err_t uart_at_init(QueueHandle_t sms_queue) {
     return ESP_OK;
 }
 
+// Helper function to get IMSI
+static esp_err_t get_sim_imsi(char *imsi_buffer, size_t buffer_size) {
+    char response[AT_RESPONSE_MAX_LEN];
+    if (at_send_command("AT+CIMI", response, sizeof(response), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get IMSI.");
+        return ESP_FAIL;
+    }
+
+    // Parse IMSI from response. It's usually the line before "OK"
+    // Example: \r\n460001234567890\r\n\r\nOK\r\n
+    char *start = strstr(response, "\r\n");
+    if (start) {
+        start += 2; // Move past the first \r\n
+        char *end = strstr(start, "\r\nOK"); // Find the start of OK
+        if (end) {
+            int len = end - start;
+            if (len > 0 && len < buffer_size) {
+                strncpy(imsi_buffer, start, len);
+                imsi_buffer[len] = '\0';
+                ESP_LOGI(TAG, "IMSI: %s", imsi_buffer);
+                return ESP_OK;
+            }
+        }
+    }
+    ESP_LOGE(TAG, "Failed to parse IMSI from response: %s", response);
+    return ESP_FAIL;
+}
+
+// Helper function to get SIM operator name
+static esp_err_t get_sim_operator_name(char *operator_buffer, size_t buffer_size) {
+    char imsi[20]; // IMSI is typically 15 digits
+    if (get_sim_imsi(imsi, sizeof(imsi)) != ESP_OK) {
+        strncpy(operator_buffer, "UNKNOWN", buffer_size);
+        return ESP_FAIL;
+    }
+
+    if (strlen(imsi) < 5) {
+        ESP_LOGW(TAG, "IMSI too short to determine operator: %s", imsi);
+        strncpy(operator_buffer, "UNKNOWN", buffer_size);
+        return ESP_FAIL;
+    }
+
+    char mcc_mnc_prefix[6]; // e.g., "46000" + null terminator
+    strncpy(mcc_mnc_prefix, imsi, 5);
+    mcc_mnc_prefix[5] = '\0';
+
+    for (size_t i = 0; i < s_operator_map_size; i++) {
+        if (strcmp(mcc_mnc_prefix, s_operator_map[i].mcc_mnc_prefix) == 0) {
+            strncpy(operator_buffer, s_operator_map[i].operator_name_zh, buffer_size - 1);
+            operator_buffer[buffer_size - 1] = '\0';
+            ESP_LOGI(TAG, "SIM Operator: %s (IMSI prefix: %s)", operator_buffer, mcc_mnc_prefix);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGW(TAG, "Unknown SIM operator for IMSI prefix: %s", mcc_mnc_prefix);
+    strncpy(operator_buffer, "UNKNOWN", buffer_size);
+    return ESP_FAIL;
+}
+
+
 void uart_at_task(void *pvParameters) {
     char response_buffer[AT_RESPONSE_MAX_LEN];
     // sms_message_t new_sms; // Removed as it's passed to handle_urc
@@ -341,6 +435,17 @@ void uart_at_task(void *pvParameters) {
         vTaskDelete(NULL);
     }
     ESP_LOGI(TAG, "Air712UG module initialized for SMS reception.");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // --- 新增：获取SIM卡运营商和本机号码 ---
+    // 6. 获取SIM卡运营商
+    if (get_sim_operator_name(g_sim_operator, sizeof(g_sim_operator)) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not determine SIM operator.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "Air712UG module initialization complete. Operator: %s", g_sim_operator);
+    // --- 新增结束 ---
 
     // Main loop to listen for incoming URCs (like +CMT:)
     while (1) {
