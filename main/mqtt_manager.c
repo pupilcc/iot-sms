@@ -1,0 +1,127 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include "esp_system.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "mqtt_client.h"
+#include "sdkconfig.h"
+
+#include "mqtt_manager.h"
+
+static const char *TAG = "mqtt_manager";
+
+// Configuration from Kconfig
+#define MQTT_BROKER_URI CONFIG_APP_MQTT_BROKER_URI
+#define MQTT_TOPIC_SMS  CONFIG_APP_MQTT_TOPIC_SMS
+
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+static bool s_mqtt_connected = false;
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+    }
+}
+
+/*
+ * @brief Event handler registered to receive MQTT events
+ */
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        s_mqtt_connected = true;
+        // Optional: Subscribe to a command topic if needed
+        // msg_id = esp_mqtt_client_subscribe(client, "/esp/commands", 0);
+        // ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        s_mqtt_connected = false;
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        // Handle incoming MQTT commands if subscribed
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        s_mqtt_connected = false;
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+        }
+        break;
+    default:
+        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+        break;
+    }
+}
+
+void mqtt_manager_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        // Add other MQTT configurations if needed, e.g., client_id, username, password, LWT
+        // .credentials.client_id = "esp32c3_sms_gateway",
+        // .credentials.username = "your_username",
+        // .credentials.password = "your_password",
+    };
+
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!s_mqtt_client) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return;
+    }
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+    ESP_LOGI(TAG, "MQTT client started, connecting to %s", MQTT_BROKER_URI);
+}
+
+esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
+    if (!s_mqtt_connected) {
+        ESP_LOGW(TAG, "MQTT not connected, cannot publish SMS.");
+        return ESP_FAIL;
+    }
+    if (!s_mqtt_client) {
+        ESP_LOGE(TAG, "MQTT client not initialized.");
+        return ESP_FAIL;
+    }
+
+    char payload[sizeof(sms->sender) + sizeof(sms->content) + 32]; // +32 for JSON overhead
+    // Example JSON format: {"sender": "+8613800000000", "content": "Hello World"}
+    snprintf(payload, sizeof(payload), "{\"sender\":\"%s\",\"content\":\"%s\"}", sms->sender, sms->content);
+
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_SMS, payload, 0, 1, 0);
+    if (msg_id == -1) {
+        ESP_LOGE(TAG, "Failed to publish SMS message to topic %s", MQTT_TOPIC_SMS);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Published SMS (msg_id=%d) to topic %s: %s", msg_id, MQTT_TOPIC_SMS, payload);
+    return ESP_OK;
+}
+
+bool mqtt_manager_is_connected(void) {
+    return s_mqtt_connected;
+}
