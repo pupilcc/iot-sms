@@ -66,19 +66,27 @@ esp_err_t sntp_manager_init(void)
     ESP_LOGI(TAG, "Waiting for system time to be synchronized...");
 
     // Wait for time to be set (with timeout)
+    // We check if time is set to a reasonable value (after 2020-01-01)
+    // This is more reliable than checking sync status
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
     int retry = 0;
     const int retry_count = SNTP_SYNC_TIMEOUT_SEC * 2; // Check every 500ms
-    while (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+    const time_t MIN_VALID_TIME = 1577836800; // 2020-01-01 00:00:00 UTC
+
+    while (++retry < retry_count) {
+        time(&now);
+        if (now > MIN_VALID_TIME) {
+            // Time has been set to a reasonable value
+            break;
+        }
         ESP_LOGD(TAG, "Waiting for time sync... (%d/%d)", retry, retry_count);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-        time_t now;
-        struct tm timeinfo;
+    time(&now);
+    if (now > MIN_VALID_TIME) {
         char strftime_buf[64];
-
-        time(&now);
         localtime_r(&now, &timeinfo);
         strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
