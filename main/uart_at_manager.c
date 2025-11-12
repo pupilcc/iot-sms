@@ -445,7 +445,7 @@ void uart_at_task(void *pvParameters) {
 
     // Initialize 4G Cat.1 modem
     ESP_LOGI(TAG, "Initializing 4G Cat.1 modem...");
-    vTaskDelay(pdMS_TO_TICKS(5000)); // Give modem more time to boot (5 seconds)
+    vTaskDelay(pdMS_TO_TICKS(120000)); // Give modem more time to boot (120 seconds)
 
     // Flush UART buffers to clear any residual data from previous sessions
     uart_flush(UART_PORT_NUM);
