@@ -581,10 +581,10 @@ static int handle_urc(char *urc_line_buffer) { // Now takes a mutable buffer
             char *second_crlf = strstr(first_crlf + 2, "\r\n");
             if (second_crlf) {
                 urc_len = (second_crlf - cmt_ptr) + 2; // Length from start of +CMT to end of second \r\n
-                
+
                 // Temporarily null-terminate the URC block for parsing
-                char temp_char = urc_line_buffer[urc_len];
-                urc_line_buffer[urc_len] = '\0';
+                char temp_char = cmt_ptr[urc_len];
+                cmt_ptr[urc_len] = '\0';
 
                 ESP_LOGI(TAG, "New SMS received (direct URC).");
                 if (parse_cmt_text_mode_response(cmt_ptr, &new_sms) == ESP_OK) {
@@ -594,8 +594,8 @@ static int handle_urc(char *urc_line_buffer) { // Now takes a mutable buffer
                         }
                     }
                 }
-                urc_line_buffer[urc_len] = temp_char; // Restore original char
-                return urc_len; // Return length of processed URC
+                cmt_ptr[urc_len] = temp_char; // Restore original char
+                return (cmt_ptr - urc_line_buffer) + urc_len; // Return total length processed from buffer start
             }
         }
     }
