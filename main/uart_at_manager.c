@@ -12,6 +12,7 @@
 #include "sdkconfig.h"
 
 #include "uart_at_manager.h"
+#include "mqtt_manager.h"
 
 // Configuration from Kconfig
 #define UART_PORT_NUM      CONFIG_APP_UART_PORT_NUM
@@ -530,6 +531,12 @@ void uart_at_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(500));
 
     ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
+
+    // 7. 发送设备就绪消息到 MQTT
+    ESP_LOGI(TAG, "Publishing device ready message to MQTT...");
+    if (mqtt_manager_publish_device_ready(g_sim_operator) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to publish device ready message.");
+    }
     // --- 新增结束 ---
 
     // Main loop to listen for incoming URCs (like +CMT:)

@@ -152,3 +152,62 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
 bool mqtt_manager_is_connected(void) {
     return s_mqtt_connected;
 }
+
+esp_err_t mqtt_manager_publish_device_ready(const char *operator_name) {
+    if (!s_mqtt_client) {
+        ESP_LOGE(TAG, "MQTT client not initialized.");
+        return ESP_FAIL;
+    }
+
+    // Wait for MQTT connection with timeout
+    const int max_wait_ms = 30000; // Wait up to 30 seconds for MQTT connection
+    const int wait_interval_ms = 1000;
+    int waited_ms = 0;
+
+    while (!s_mqtt_connected && waited_ms < max_wait_ms) {
+        ESP_LOGI(TAG, "Waiting for MQTT connection before sending device ready message... (%d/%d ms)",
+                 waited_ms, max_wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(wait_interval_ms));
+        waited_ms += wait_interval_ms;
+    }
+
+    if (!s_mqtt_connected) {
+        ESP_LOGW(TAG, "MQTT not connected after waiting, cannot publish device ready message.");
+        return ESP_FAIL;
+    }
+
+    // Get current timestamp
+    time_t now;
+    struct tm timeinfo;
+    char timestamp[32];
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // Format time as ISO 8601: YYYY-MM-DDTHH:MM:SSZ
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+    // Determine operator string
+    const char *operator_str = (operator_name && strlen(operator_name) > 0) ? operator_name : "未知运营商";
+
+    // Build human-readable message
+    char message[64];
+    snprintf(message, sizeof(message), "%s设备已就绪", operator_str);
+
+    // Build JSON payload
+    // Format: {"status":"ready","operator":"中国电信","timestamp":"2025-11-13T10:30:00Z","message":"中国电信设备已就绪"}
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"status\":\"ready\",\"operator\":\"%s\",\"timestamp\":\"%s\",\"message\":\"%s\"}",
+             operator_str, timestamp, message);
+
+    // Publish to 'esp32/device' topic
+    const char *device_ready_topic = "esp32/device";
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, device_ready_topic, payload, 0, 1, 0);
+    if (msg_id == -1) {
+        ESP_LOGE(TAG, "Failed to publish device ready message to topic %s", device_ready_topic);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Published device ready (msg_id=%d) to topic %s: %s", msg_id, device_ready_topic, payload);
+    return ESP_OK;
+}

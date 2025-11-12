@@ -24,4 +24,12 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms);
  */
 bool mqtt_manager_is_connected(void);
 
+/**
+ * @brief Publishes a device ready message to the 'esp32/drive' topic.
+ *
+ * @param operator_name The SIM operator name (e.g., "中国移动", "中国电信").
+ * @return ESP_OK if message was successfully queued for publishing, ESP_FAIL otherwise.
+ */
+esp_err_t mqtt_manager_publish_device_ready(const char *operator_name);
+
 #endif // MQTT_MANAGER_H
