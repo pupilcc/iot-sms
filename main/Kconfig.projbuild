@@ -49,4 +49,10 @@ menu "Application Configuration"
         help
             MQTT topic to publish received SMS messages.
 
+    config APP_SNTP_TIMEZONE
+        string "Timezone"
+        default "UTC0"
+        help
+            Timezone string in POSIX format (e.g., "UTC0" for UTC, "CST-8" for China Standard Time UTC+8, "EST5EDT,M3.2.0/2,M11.1.0" for US Eastern Time).
+
 endmenu

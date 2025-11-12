@@ -14,6 +14,7 @@
 #include "uart_at_manager.h"
 #include "mqtt_manager.h"
 #include "sms_processor.h"
+#include "sntp_manager.h"
 
 static const char *TAG = "app_main";
 
@@ -54,23 +55,29 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Wi-Fi connected successfully.");
 
-    // 2. Create SMS message queue
+    // 2. Initialize SNTP and synchronize time
+    ESP_LOGI(TAG, "Synchronizing time via SNTP...");
+    if (sntp_manager_init() != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP time synchronization failed. Continuing with system time.");
+    }
+
+    // 3. Create SMS message queue
     g_sms_queue = xQueueCreate(10, sizeof(sms_message_t)); // Queue can hold 10 SMS messages
     if (g_sms_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create SMS queue. Aborting.");
         while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
-    // 3. Initialize UART AT manager and create its task
+    // 4. Initialize UART AT manager and create its task
     ESP_LOGI(TAG, "Initializing UART AT manager...");
     ESP_ERROR_CHECK(uart_at_init(g_sms_queue));
     xTaskCreate(uart_at_task, "uart_at_task", 4096, NULL, 6, NULL); // Increased stack size for parsing
 
-    // 4. Start MQTT client
+    // 5. Start MQTT client
     ESP_LOGI(TAG, "Starting MQTT client...");
     mqtt_manager_start();
 
-    // 5. Create SMS processor task
+    // 6. Create SMS processor task
     ESP_LOGI(TAG, "Creating SMS processor task...");
     xTaskCreate(sms_processor_task, "sms_processor_task", 3072, (void*)g_sms_queue, 4, NULL);
 

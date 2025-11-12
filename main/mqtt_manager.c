@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -110,22 +112,33 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
         return ESP_FAIL;
     }
 
+    // 获取当前时间戳
+    time_t now;
+    struct tm timeinfo;
+    char timestamp[32];
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // 格式化时间为 ISO 8601 格式: YYYY-MM-DDTHH:MM:SSZ
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
     // 计算新的JSON payload所需的缓冲区大小
-    // 格式示例: {"sender":"%s","content":"%s","operator":"%s","device_number":"%s"}
-    // 最大长度估算: sender (20), content (256), operator (32), device_number (20)
+    // 格式示例: {"sender":"%s","content":"%s","operator":"%s","timestamp":"%s"}
+    // 最大长度估算: sender (32), content (256), operator (32), timestamp (32)
     // 加上固定的JSON字符 (引号, 逗号, 冒号, 大括号) 和 null 终止符
-    // 大致: 20 + 256 + 32 + 20 + (固定JSON开销 ~ 60) = ~388 字节
+    // 大致: 32 + 256 + 32 + 32 + (固定JSON开销 ~ 80) = ~432 字节
     // 使用一个足够大的缓冲区，例如 512 字节。
-    char payload[512]; 
-    
+    char payload[512];
+
     // 检查运营商和本机号码是否可用，如果为空则使用"UNKNOWN"
     const char *operator_str = (strlen(g_sim_operator) > 0) ? g_sim_operator : "UNKNOWN";
 
-    // 构建包含运营商和本机号码的JSON payload
-    // 示例 JSON 格式: {"sender": "+8613800000000", "content": "Hello World", "operator": "中国移动"}
-    snprintf(payload, sizeof(payload), 
-             "{\"sender\":\"%s\",\"content\":\"%s\",\"operator\":\"%s\"}", 
-             sms->sender, sms->content, operator_str);
+    // 构建包含运营商、时间戳的JSON payload
+    // 示例 JSON 格式: {"sender": "+8613800000000", "content": "Hello World", "operator": "中国移动", "timestamp": "2025-11-12T10:30:00Z"}
+    snprintf(payload, sizeof(payload),
+             "{\"sender\":\"%s\",\"content\":\"%s\",\"operator\":\"%s\",\"timestamp\":\"%s\"}",
+             sms->sender, sms->content, operator_str, timestamp);
 
     int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_SMS, payload, 0, 1, 0);
     if (msg_id == -1) {

@@ -15,6 +15,9 @@ CONFIG_BROKER_URL="mqtt://broker.emqx.io:1883" # This is the default from the ex
 CONFIG_APP_MQTT_BROKER_URI="mqtt://broker.emqx.io:1883"
 CONFIG_APP_MQTT_TOPIC_SMS="esp32/sms"
 
+# SNTP Configuration
+CONFIG_APP_SNTP_TIMEZONE="UTC0"
+
 # Log levels (optional, for debugging)
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL=V
