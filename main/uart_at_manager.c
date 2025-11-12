@@ -281,11 +281,15 @@ static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_
             content_hex_len--;
         }
 
+        ESP_LOGD(TAG, "Content hex length: %d", content_hex_len);
+        ESP_LOGD(TAG, "Content hex string (first 100 chars): %.100s", content_hex_start);
+
         if (content_hex_len > 0 && content_hex_len < (sizeof(sms_msg->content) * 2 + 1)) { // Max possible hex length
             char temp_content_hex[sizeof(sms_msg->content) * 2 + 1];
             strncpy(temp_content_hex, content_hex_start, content_hex_len);
             temp_content_hex[content_hex_len] = '\0';
 
+            ESP_LOGD(TAG, "Calling decode_ucs2_hex_to_utf8 with hex string length: %d", content_hex_len);
             // Decode UCS2 hex to UTF-8
             decode_ucs2_hex_to_utf8(temp_content_hex, sms_msg->content, sizeof(sms_msg->content));
             ESP_LOGI(TAG, "Parsed SMS: Sender='%s', Content='%s'", sms_msg->sender, sms_msg->content);
@@ -620,14 +624,17 @@ static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, si
     size_t ucs2_hex_len = strlen(ucs2_hex_str);
     size_t utf8_idx = 0;
 
-    for (size_t i = 0; i + 3 < ucs2_hex_len && utf8_idx < utf8_buf_len - 1; i += 4) {
+    ESP_LOGD(TAG, "decode_ucs2_hex_to_utf8: Input hex length: %d, Output buffer size: %d", ucs2_hex_len, utf8_buf_len);
+
+    for (size_t i = 0; i + 4 <= ucs2_hex_len && utf8_idx < utf8_buf_len - 4; i += 4) {
         int h1 = hex_char_to_int(ucs2_hex_str[i]);
         int h2 = hex_char_to_int(ucs2_hex_str[i+1]);
         int h3 = hex_char_to_int(ucs2_hex_str[i+2]);
         int h4 = hex_char_to_int(ucs2_hex_str[i+3]);
 
         if (h1 == -1 || h2 == -1 || h3 == -1 || h4 == -1) {
-            ESP_LOGW(TAG, "Invalid UCS2 hex character encountered.");
+            ESP_LOGW(TAG, "Invalid UCS2 hex character at position %d: %c%c%c%c",
+                     i, ucs2_hex_str[i], ucs2_hex_str[i+1], ucs2_hex_str[i+2], ucs2_hex_str[i+3]);
             break;
         }
 
@@ -641,6 +648,7 @@ static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, si
                 utf8_buf[utf8_idx++] = 0xC0 | (ucs2_char >> 6);
                 utf8_buf[utf8_idx++] = 0x80 | (ucs2_char & 0x3F);
             } else {
+                ESP_LOGW(TAG, "UTF-8 buffer too small for 2-byte char at position %d (utf8_idx=%d)", i, utf8_idx);
                 break; // Buffer too small
             }
         } else { // 3-byte UTF-8
@@ -649,9 +657,11 @@ static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, si
                 utf8_buf[utf8_idx++] = 0x80 | ((ucs2_char >> 6) & 0x3F);
                 utf8_buf[utf8_idx++] = 0x80 | (ucs2_char & 0x3F);
             } else {
+                ESP_LOGW(TAG, "UTF-8 buffer too small for 3-byte char at position %d (utf8_idx=%d)", i, utf8_idx);
                 break; // Buffer too small
             }
         }
     }
+    ESP_LOGD(TAG, "decode_ucs2_hex_to_utf8: Decoded %d UTF-8 bytes from %d hex chars", utf8_idx, ucs2_hex_len);
     utf8_buf[utf8_idx] = '\0'; // Null-terminate
 }
