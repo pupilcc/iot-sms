@@ -13,29 +13,29 @@ menu "Application Configuration"
             Password of the Wi-Fi network.
 
     config APP_UART_PORT_NUM
-        int "UART Port Number for Air712UG"
+        int "UART Port Number for 4G Modem"
         default 1
         range 0 2
         help
-            UART port to use for communication with Air712UG. (ESP32C3 has UART0, UART1)
+            UART port to use for communication with 4G Cat.1 modem. (ESP32C3 has UART0, UART1)
 
     config APP_UART_TXD
-        int "UART TXD Pin for Air712UG"
+        int "UART TXD Pin for 4G Modem"
         default 21
         help
-            GPIO pin for UART TX (connects to Air712UG RX).
+            GPIO pin for UART TX (connects to 4G modem RX).
 
     config APP_UART_RXD
-        int "UART RXD Pin for Air712UG"
+        int "UART RXD Pin for 4G Modem"
         default 20
         help
-            GPIO pin for UART RX (connects to Air712UG TX).
+            GPIO pin for UART RX (connects to 4G modem TX).
 
     config APP_UART_BAUD_RATE
-        int "UART Baud Rate for Air712UG"
+        int "UART Baud Rate for 4G Modem"
         default 115200
         help
-            Baud rate for UART communication with Air712UG.
+            Baud rate for UART communication with 4G Cat.1 modem.
 
     config APP_MQTT_BROKER_URI
         string "MQTT Broker URI"

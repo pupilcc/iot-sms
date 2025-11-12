@@ -16,7 +16,7 @@ extern char g_sim_operator[32];     // 例如："中国移动", "中国联通"
 extern char g_sim_phone_number[20]; // 例如："+8613800000000"
 
 /**
- * @brief Initializes the UART driver for AT communication with Air712UG.
+ * @brief Initializes the UART driver for AT communication with 4G Cat.1 modem.
  *
  * @param sms_queue A FreeRTOS queue to send parsed SMS messages to.
  * @return ESP_OK on success, error code otherwise.

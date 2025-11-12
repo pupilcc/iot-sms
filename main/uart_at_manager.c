@@ -398,13 +398,13 @@ void uart_at_task(void *pvParameters) {
     char response_buffer[AT_RESPONSE_MAX_LEN];
     // sms_message_t new_sms; // Removed as it's passed to handle_urc
 
-    // Initialize Air712UG module
-    ESP_LOGI(TAG, "Initializing Air712UG module...");
-    vTaskDelay(pdMS_TO_TICKS(5000)); // Give module more time to boot (5 seconds)
+    // Initialize 4G Cat.1 modem
+    ESP_LOGI(TAG, "Initializing 4G Cat.1 modem...");
+    vTaskDelay(pdMS_TO_TICKS(5000)); // Give modem more time to boot (5 seconds)
 
     // 1. Test AT command
     if (at_send_command("AT", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to communicate with Air712UG (AT command failed).");
+        ESP_LOGE(TAG, "Failed to communicate with 4G modem (AT command failed).");
         // Consider a retry mechanism or reboot here
         vTaskDelete(NULL);
     }
@@ -434,7 +434,7 @@ void uart_at_task(void *pvParameters) {
         ESP_LOGE(TAG, "Failed to configure new SMS indications (AT+CNMI).");
         vTaskDelete(NULL);
     }
-    ESP_LOGI(TAG, "Air712UG module initialized for SMS reception.");
+    ESP_LOGI(TAG, "4G modem initialized for SMS reception.");
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // --- 新增：获取SIM卡运营商和本机号码 ---
@@ -444,7 +444,7 @@ void uart_at_task(void *pvParameters) {
     }
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    ESP_LOGI(TAG, "Air712UG module initialization complete. Operator: %s", g_sim_operator);
+    ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
     // --- 新增结束 ---
 
     // Main loop to listen for incoming URCs (like +CMT:)
@@ -458,7 +458,7 @@ void uart_at_task(void *pvParameters) {
 
         if (uxBits & AT_RESPONSE_URC_BIT) {
             xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
-            ESP_LOGI(TAG, "Received URC from Air712UG: %s", s_uart_rx_buffer);
+            ESP_LOGI(TAG, "Received URC from 4G modem: %s", s_uart_rx_buffer);
 
             // Process URCs one by one from the buffer
             int processed_len = 0;
