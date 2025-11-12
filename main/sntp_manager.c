@@ -40,6 +40,12 @@ esp_err_t sntp_manager_init(void)
 {
     ESP_LOGI(TAG, "Initializing SNTP for time synchronization...");
 
+    // Stop SNTP if it's already running (important for device restarts)
+    if (esp_sntp_enabled()) {
+        ESP_LOGI(TAG, "SNTP already running, stopping it first...");
+        esp_sntp_stop();
+    }
+
     // Set timezone from configuration
     // Examples: "UTC0" for UTC, "CST-8" for China (UTC+8), "EST5EDT,M3.2.0/2,M11.1.0" for US Eastern
     ESP_LOGI(TAG, "Setting timezone to: %s", TIMEZONE);

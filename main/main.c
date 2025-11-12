@@ -78,6 +78,9 @@ void app_main(void)
     ESP_LOGI(TAG, "All critical components initialized.");
 
     // 6. Initialize SNTP and synchronize time (non-critical, done last)
+    // Give network stack a moment to fully stabilize after Wi-Fi connection
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     ESP_LOGI(TAG, "Synchronizing time via SNTP...");
     if (sntp_manager_init() != ESP_OK) {
         ESP_LOGW(TAG, "SNTP time synchronization failed. Continuing with system time.");

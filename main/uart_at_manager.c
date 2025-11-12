@@ -30,6 +30,8 @@ static QueueHandle_t s_uart_event_queue = NULL; // Declare event queue handle
 static char s_uart_rx_buffer[BUF_SIZE];
 static int s_uart_rx_buffer_idx = 0;
 static SemaphoreHandle_t s_uart_rx_mutex; // Mutex to protect rx_buffer access
+static TaskHandle_t s_uart_event_task_handle = NULL; // Task handle for cleanup
+static TaskHandle_t s_uart_at_task_handle = NULL; // Task handle for AT manager task
 
 // Event group to signal AT command response
 static EventGroupHandle_t s_at_response_event_group;
@@ -302,8 +304,44 @@ static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_
 
 esp_err_t uart_at_init(QueueHandle_t sms_queue) {
     s_sms_queue = sms_queue;
-    s_uart_rx_mutex = xSemaphoreCreateMutex();
-    s_at_response_event_group = xEventGroupCreate();
+
+    // Delete existing AT task if running (important for device restarts)
+    if (s_uart_at_task_handle != NULL) {
+        ESP_LOGI(TAG, "UART AT task already running, deleting it first...");
+        vTaskDelete(s_uart_at_task_handle);
+        s_uart_at_task_handle = NULL;
+        vTaskDelay(pdMS_TO_TICKS(100)); // Give time for task cleanup
+    }
+
+    // Delete existing UART event task if running (important for device restarts)
+    if (s_uart_event_task_handle != NULL) {
+        ESP_LOGI(TAG, "UART event task already running, deleting it first...");
+        vTaskDelete(s_uart_event_task_handle);
+        s_uart_event_task_handle = NULL;
+        vTaskDelay(pdMS_TO_TICKS(100)); // Give time for task cleanup
+    }
+
+    // Clean up existing UART driver if already installed (important for device restarts)
+    if (uart_is_driver_installed(UART_PORT_NUM)) {
+        ESP_LOGI(TAG, "UART driver already installed on port %d, uninstalling first...", UART_PORT_NUM);
+        uart_driver_delete(UART_PORT_NUM);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Give time for cleanup
+    }
+
+    // Create or reset synchronization primitives
+    if (s_uart_rx_mutex == NULL) {
+        s_uart_rx_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_at_response_event_group == NULL) {
+        s_at_response_event_group = xEventGroupCreate();
+    } else {
+        // Clear all bits if event group already exists
+        xEventGroupClearBits(s_at_response_event_group, 0xFFFFFF);
+    }
+
+    // Clear UART RX buffer
+    s_uart_rx_buffer_idx = 0;
+    s_uart_rx_buffer[0] = '\0';
 
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
@@ -324,8 +362,8 @@ esp_err_t uart_at_init(QueueHandle_t sms_queue) {
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TXD, UART_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // Create a task to handle UART events
-    xTaskCreate(uart_event_task, "uart_event_task", 3072, NULL, 10, NULL);
+    // Create a task to handle UART events and save the handle
+    xTaskCreate(uart_event_task, "uart_event_task", 3072, NULL, 10, &s_uart_event_task_handle);
 
     ESP_LOGI(TAG, "UART AT manager initialized on port %d, TX:%d, RX:%d, Baud:%d",
              UART_PORT_NUM, UART_TXD, UART_RXD, UART_BAUD_RATE);
@@ -398,16 +436,59 @@ void uart_at_task(void *pvParameters) {
     char response_buffer[AT_RESPONSE_MAX_LEN];
     // sms_message_t new_sms; // Removed as it's passed to handle_urc
 
+    // Register this task's handle for cleanup on restart
+    s_uart_at_task_handle = xTaskGetCurrentTaskHandle();
+
     // Initialize 4G Cat.1 modem
     ESP_LOGI(TAG, "Initializing 4G Cat.1 modem...");
     vTaskDelay(pdMS_TO_TICKS(5000)); // Give modem more time to boot (5 seconds)
 
-    // 1. Test AT command
-    if (at_send_command("AT", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to communicate with 4G modem (AT command failed).");
+    // Flush UART buffers to clear any residual data from previous sessions
+    uart_flush(UART_PORT_NUM);
+    xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
+    s_uart_rx_buffer_idx = 0;
+    s_uart_rx_buffer[0] = '\0';
+    xSemaphoreGive(s_uart_rx_mutex);
+    ESP_LOGI(TAG, "UART buffers flushed, ready for AT commands.");
+
+    // Send wake-up sequence to ensure modem is responsive
+    // This is important when ESP32 restarts but modem is still running
+    ESP_LOGI(TAG, "Sending wake-up sequence to modem...");
+    for (int i = 0; i < 3; i++) {
+        uart_write_bytes(UART_PORT_NUM, "AT\r\n", 4);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    // Clear any responses from wake-up sequence
+    vTaskDelay(pdMS_TO_TICKS(500));
+    uart_flush(UART_PORT_NUM);
+    xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
+    s_uart_rx_buffer_idx = 0;
+    s_uart_rx_buffer[0] = '\0';
+    xSemaphoreGive(s_uart_rx_mutex);
+    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT | AT_RESPONSE_URC_BIT);
+    ESP_LOGI(TAG, "Wake-up sequence complete, modem should be responsive.");
+
+    // 1. Test AT command (with retry mechanism)
+    int retry_count = 0;
+    const int max_retries = 3;
+    esp_err_t at_result = ESP_FAIL;
+
+    while (retry_count < max_retries && at_result != ESP_OK) {
+        if (retry_count > 0) {
+            ESP_LOGW(TAG, "Retrying AT command (%d/%d)...", retry_count + 1, max_retries);
+            vTaskDelay(pdMS_TO_TICKS(1000)); // Wait before retry
+        }
+        at_result = at_send_command("AT", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS));
+        retry_count++;
+    }
+
+    if (at_result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to communicate with 4G modem after %d attempts.", max_retries);
         // Consider a retry mechanism or reboot here
         vTaskDelete(NULL);
     }
+    ESP_LOGI(TAG, "AT command successful, modem is responding.");
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // 2. Disable echo (ATE0) - This is important to simplify parsing
