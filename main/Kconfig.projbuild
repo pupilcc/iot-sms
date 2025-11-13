@@ -49,6 +49,12 @@ menu "Application Configuration"
         help
             MQTT topic to publish received SMS messages.
 
+    config APP_SIM_PHONE_NUMBER
+        string "SIM Card Phone Number"
+        default ""
+        help
+            Phone number of the SIM card in this device (e.g., "+8613800138000"). Leave empty if unknown.
+
     config APP_SNTP_TIMEZONE
         string "Timezone"
         default "UTC0"

@@ -19,6 +19,7 @@ static const char *TAG = "mqtt_manager";
 // Configuration from Kconfig
 #define MQTT_BROKER_URI CONFIG_APP_MQTT_BROKER_URI
 #define MQTT_TOPIC_SMS  CONFIG_APP_MQTT_TOPIC_SMS
+#define SIM_PHONE_NUMBER CONFIG_APP_SIM_PHONE_NUMBER
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static bool s_mqtt_connected = false;
@@ -133,12 +134,13 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
 
     // 检查运营商和本机号码是否可用，如果为空则使用"UNKNOWN"
     const char *operator_str = (strlen(g_sim_operator) > 0) ? g_sim_operator : "UNKNOWN";
+    const char *local_number = (strlen(SIM_PHONE_NUMBER) > 0) ? SIM_PHONE_NUMBER : "UNKNOWN";
 
-    // 构建包含运营商、时间戳的JSON payload
-    // 示例 JSON 格式: {"sender": "+8613800000000", "content": "Hello World", "operator": "中国移动", "timestamp": "2025-11-12T10:30:00Z"}
+    // 构建包含运营商、本机号码、时间戳的JSON payload
+    // 示例 JSON 格式: {"sender": "+8613800000000", "content": "Hello World", "local_number": "+8613900000000", "operator": "中国移动", "timestamp": "2025-11-12T10:30:00Z"}
     snprintf(payload, sizeof(payload),
-             "{\"sender\":\"%s\",\"content\":\"%s\",\"operator\":\"%s\",\"timestamp\":\"%s\"}",
-             sms->sender, sms->content, operator_str, timestamp);
+             "{\"sender\":\"%s\",\"content\":\"%s\",\"local_number\":\"%s\",\"operator\":\"%s\",\"timestamp\":\"%s\"}",
+             sms->sender, sms->content, local_number, operator_str, timestamp);
 
     int msg_id = esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_SMS, payload, 0, 1, 0);
     if (msg_id == -1) {
@@ -189,17 +191,14 @@ esp_err_t mqtt_manager_publish_device_ready(const char *operator_name) {
 
     // Determine operator string
     const char *operator_str = (operator_name && strlen(operator_name) > 0) ? operator_name : "未知运营商";
-
-    // Build human-readable message
-    char message[64];
-    snprintf(message, sizeof(message), "%s设备已就绪", operator_str);
+    const char *local_number = (strlen(SIM_PHONE_NUMBER) > 0) ? SIM_PHONE_NUMBER : "未知号码";
 
     // Build JSON payload
-    // Format: {"status":"ready","operator":"中国电信","timestamp":"2025-11-13T10:30:00Z","message":"中国电信设备已就绪"}
+    // Format: {"status":"ready","operator":"中国电信","local_number":"+8613800138000","timestamp":"2025-11-13T10:30:00Z"}
     char payload[256];
     snprintf(payload, sizeof(payload),
-             "{\"status\":\"ready\",\"operator\":\"%s\",\"timestamp\":\"%s\",\"message\":\"%s\"}",
-             operator_str, timestamp, message);
+             "{\"status\":\"ready\",\"operator\":\"%s\",\"local_number\":\"%s\",\"timestamp\":\"%s\"}",
+             operator_str, local_number, timestamp);
 
     // Publish to 'esp32/device' topic
     const char *device_ready_topic = "esp32/device";
