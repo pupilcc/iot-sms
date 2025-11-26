@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "sms_storage.c" "main.c"
                            "wifi_manager.c"
                            "uart_at_manager.c"
                            "mqtt_manager.c"

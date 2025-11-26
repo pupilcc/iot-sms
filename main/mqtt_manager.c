@@ -43,14 +43,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     (void)handler_args; // Mark as intentionally unused
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED - Successfully connected to broker");
+        ESP_LOGI(TAG, "MQTT keep-alive: 120s, connection stable");
         s_mqtt_connected = true;
         // Optional: Subscribe to a command topic if needed
         // msg_id = esp_mqtt_client_subscribe(client, "/esp/commands", 0);
         // ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
         break;
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED - Connection lost, auto-reconnect enabled");
+        ESP_LOGW(TAG, "MQTT will attempt to reconnect every %d ms", 5000);
         s_mqtt_connected = false;
         break;
     case MQTT_EVENT_SUBSCRIBED:
@@ -88,6 +90,13 @@ void mqtt_manager_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
+        // Network configuration for stability
+        .network.timeout_ms = 10000,              // Network timeout 10 seconds
+        .network.reconnect_timeout_ms = 5000,     // Reconnect interval 5 seconds
+        .network.disable_auto_reconnect = false,  // Enable automatic reconnection
+        // Session configuration with keep-alive
+        .session.keepalive = 120,                 // Keep-alive interval 120 seconds
+        .session.disable_keepalive = false,       // Enable keep-alive mechanism
         // Add other MQTT configurations if needed, e.g., client_id, username, password, LWT
         // .credentials.client_id = "esp32c3_sms_gateway",
         // .credentials.username = "your_username",
