@@ -65,7 +65,7 @@ void app_main(void)
     // 3. Initialize UART AT manager and create its task
     ESP_LOGI(TAG, "Initializing UART AT manager...");
     ESP_ERROR_CHECK(uart_at_init(g_sms_queue));
-    xTaskCreate(uart_at_task, "uart_at_task", 4096, NULL, 6, NULL); // Increased stack size for parsing
+    xTaskCreate(uart_at_task, "uart_at_task", 8192, NULL, 6, NULL); // 8KB stack for SMS fragment processing (sms_message_t is 2KB)
 
     // 4. Start MQTT client
     ESP_LOGI(TAG, "Starting MQTT client...");
@@ -73,7 +73,7 @@ void app_main(void)
 
     // 5. Create SMS processor task
     ESP_LOGI(TAG, "Creating SMS processor task...");
-    xTaskCreate(sms_processor_task, "sms_processor_task", 3072, (void*)g_sms_queue, 4, NULL);
+    xTaskCreate(sms_processor_task, "sms_processor_task", 10240, (void*)g_sms_queue, 4, NULL); // 10KB stack (sms_message_t=2KB + mqtt_payload=2.5KB + network stack)
 
     ESP_LOGI(TAG, "All critical components initialized.");
 

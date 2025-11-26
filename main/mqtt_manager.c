@@ -38,8 +38,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
     esp_mqtt_event_handle_t event = event_data;
-    esp_mqtt_client_handle_t client = event->client;
-    int msg_id;
+    // esp_mqtt_client_handle_t client = event->client; // Unused for now
+    // int msg_id; // Unused for now
+    (void)handler_args; // Mark as intentionally unused
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
@@ -126,11 +127,11 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
 
     // 计算新的JSON payload所需的缓冲区大小
     // 格式示例: {"sender":"%s","content":"%s","operator":"%s","timestamp":"%s"}
-    // 最大长度估算: sender (32), content (256), operator (32), timestamp (32)
+    // 最大长度估算: sender (32), content (2048), local_number (32), operator (32), timestamp (32)
     // 加上固定的JSON字符 (引号, 逗号, 冒号, 大括号) 和 null 终止符
-    // 大致: 32 + 256 + 32 + 32 + (固定JSON开销 ~ 80) = ~432 字节
-    // 使用一个足够大的缓冲区，例如 512 字节。
-    char payload[512];
+    // 大致: 32 + 2048 + 32 + 32 + 32 + (固定JSON开销 ~ 100) = ~2276 字节
+    // 使用一个足够大的缓冲区，例如 2560 字节 (2.5KB)
+    char payload[2560];
 
     // 检查运营商和本机号码是否可用，如果为空则使用"UNKNOWN"
     const char *operator_str = (strlen(g_sim_operator) > 0) ? g_sim_operator : "UNKNOWN";

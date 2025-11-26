@@ -8,7 +8,7 @@
 // 定义短信数据结构
 typedef struct {
     char sender[32];    // 短信发送者号码
-    char content[256];  // 短信内容
+    char content[2048]; // 短信内容 (支持长SMS,最大约4-5段拼接)
 } sms_message_t;
 
 // 全局变量，用于存储SIM卡运营商和本机号码

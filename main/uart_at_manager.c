@@ -43,11 +43,31 @@ static EventGroupHandle_t s_at_response_event_group;
 // 全局变量定义和初始化
 char g_sim_operator[32] = {0};
 
+// SMS分段拼接相关结构和常量
+#define SMS_FRAGMENT_TIMEOUT_MS 30000  // 30秒超时,认为分段SMS已完成
+#define MAX_SMS_FRAGMENTS 10           // 最大支持10段SMS拼接
+#define SMS_FRAGMENT_THRESHOLD 500     // hex字符串超过500认为可能是分段SMS
+
+typedef struct {
+    char sender[32];              // 发件人号码
+    char accumulated_content[2048]; // 累积的内容(hex格式)
+    TickType_t last_fragment_time; // 上次片段到达时间
+    int fragment_count;            // 已接收片段数
+    bool is_active;                // 是否有活跃的分段SMS
+} sms_fragment_buffer_t;
+
+static sms_fragment_buffer_t s_fragment_buffer = {0};
+
 // Forward declarations
 static int handle_urc(char *urc_line_buffer);
 static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t buffer_size, TickType_t timeout_ticks);
 static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_t *sms_msg);
 static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, size_t utf8_buf_len);
+
+// SMS分段拼接相关函数声明
+static bool is_fragment_timeout(void);
+static void reset_fragment_buffer(void);
+static esp_err_t process_sms_fragment(const char *sender, const char *content_hex, int content_hex_len, sms_message_t *complete_sms);
 
 // 新增的获取SIM卡信息的辅助函数
 static esp_err_t get_sim_imsi(char *imsi_buffer, size_t buffer_size);
@@ -224,15 +244,23 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
  * @brief Parses a +CMT response (Text Mode) to extract sender and content.
  * Example: +CMT: "+8613800000000","","23/08/15,10:30:00+32"\r\nHello World\r\n
  *
+ * 支持SMS分段拼接:
+ * - 对于长SMS(hex内容>500),会自动累积到缓冲区
+ * - 只有收到最后一段时才返回ESP_OK和完整消息
+ * - 中间片段返回ESP_ERR_INVALID_STATE,表示需要等待更多片段
+ *
  * @param response The full AT response string.
  * @param sms_msg Pointer to sms_message_t to fill.
- * @return ESP_OK on success, ESP_FAIL if parsing fails.
+ * @return ESP_OK on success (complete SMS ready),
+ *         ESP_ERR_INVALID_STATE if waiting for more fragments,
+ *         ESP_FAIL if parsing fails.
  */
 static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_t *sms_msg) {
     const char *cmt_prefix = "+CMT:";
     const char *sender_hex_start = NULL;
     const char *sender_hex_end = NULL;
     const char *content_hex_start = NULL;
+    char decoded_sender[32] = {0};
 
     if (!response || !sms_msg) return ESP_FAIL;
 
@@ -249,18 +277,18 @@ static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_
         sender_hex_end = strchr(sender_hex_start, '"'); // Sender number end
         if (sender_hex_end) {
             // Extract the UCS2 hex string for sender
-            char temp_sender_hex[sizeof(sms_msg->sender) * 2 + 1]; // Max possible hex length
+            char temp_sender_hex[sizeof(decoded_sender) * 2 + 1]; // Max possible hex length
             int len = sender_hex_end - sender_hex_start;
             if (len > 0 && len < sizeof(temp_sender_hex)) {
                 strncpy(temp_sender_hex, sender_hex_start, len);
                 temp_sender_hex[len] = '\0';
-                
+
                 // Decode UCS2 hex to UTF-8
-                decode_ucs2_hex_to_utf8(temp_sender_hex, sms_msg->sender, sizeof(sms_msg->sender));
-                ESP_LOGD(TAG, "Decoded Sender: %s", sms_msg->sender);
+                decode_ucs2_hex_to_utf8(temp_sender_hex, decoded_sender, sizeof(decoded_sender));
+                ESP_LOGD(TAG, "Decoded Sender: %s", decoded_sender);
             } else {
                 ESP_LOGW(TAG, "Sender hex string too long or empty. Len: %d", len);
-                strncpy(sms_msg->sender, "UNKNOWN", sizeof(sms_msg->sender));
+                strncpy(decoded_sender, "UNKNOWN", sizeof(decoded_sender));
             }
         }
     }
@@ -285,19 +313,38 @@ static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_
         ESP_LOGD(TAG, "Content hex length: %d", content_hex_len);
         ESP_LOGD(TAG, "Content hex string (first 100 chars): %.100s", content_hex_start);
 
-        if (content_hex_len > 0 && content_hex_len < (sizeof(sms_msg->content) * 2 + 1)) { // Max possible hex length
-            char temp_content_hex[sizeof(sms_msg->content) * 2 + 1];
+        if (content_hex_len > 0) {
+            // 使用动态分配来处理更长的hex字符串
+            char *temp_content_hex = malloc(content_hex_len + 1);
+            if (!temp_content_hex) {
+                ESP_LOGE(TAG, "Failed to allocate memory for content hex string");
+                return ESP_FAIL;
+            }
+
             strncpy(temp_content_hex, content_hex_start, content_hex_len);
             temp_content_hex[content_hex_len] = '\0';
 
-            ESP_LOGD(TAG, "Calling decode_ucs2_hex_to_utf8 with hex string length: %d", content_hex_len);
-            // Decode UCS2 hex to UTF-8
-            decode_ucs2_hex_to_utf8(temp_content_hex, sms_msg->content, sizeof(sms_msg->content));
-            ESP_LOGI(TAG, "Parsed SMS: Sender='%s', Content='%s'", sms_msg->sender, sms_msg->content);
-            return ESP_OK;
+            ESP_LOGI(TAG, "Processing SMS fragment: Sender='%s', hex_len=%d", decoded_sender, content_hex_len);
+
+            // 使用分段处理逻辑
+            esp_err_t fragment_result = process_sms_fragment(decoded_sender, temp_content_hex, content_hex_len, sms_msg);
+
+            free(temp_content_hex);
+
+            if (fragment_result == ESP_OK) {
+                ESP_LOGI(TAG, "Complete SMS assembled: Sender='%s', Content='%.100s%s'",
+                         sms_msg->sender, sms_msg->content, strlen(sms_msg->content) > 100 ? "..." : "");
+                return ESP_OK;
+            } else if (fragment_result == ESP_ERR_INVALID_STATE) {
+                ESP_LOGI(TAG, "SMS fragment stored, waiting for more fragments...");
+                return ESP_ERR_INVALID_STATE; // 需要等待更多片段
+            } else {
+                ESP_LOGE(TAG, "Failed to process SMS fragment");
+                return ESP_FAIL;
+            }
         } else {
-            ESP_LOGW(TAG, "SMS content hex string too long or empty. Len: %d", content_hex_len);
-            strncpy(sms_msg->content, "EMPTY_OR_TOO_LONG", sizeof(sms_msg->content));
+            ESP_LOGW(TAG, "SMS content hex string is empty");
+            strncpy(sms_msg->content, "EMPTY", sizeof(sms_msg->content));
             return ESP_FAIL;
         }
     }
@@ -598,13 +645,24 @@ static int handle_urc(char *urc_line_buffer) { // Now takes a mutable buffer
                 cmt_ptr[urc_len] = '\0';
 
                 ESP_LOGI(TAG, "New SMS received (direct URC).");
-                if (parse_cmt_text_mode_response(cmt_ptr, &new_sms) == ESP_OK) {
+                esp_err_t parse_result = parse_cmt_text_mode_response(cmt_ptr, &new_sms);
+
+                if (parse_result == ESP_OK) {
+                    // 完整SMS已组装完成,发送到队列
                     if (s_sms_queue != NULL) {
                         if (xQueueSend(s_sms_queue, &new_sms, portMAX_DELAY) != pdPASS) {
-                            ESP_LOGE(TAG, "Failed to send SMS to queue.");
+                            ESP_LOGE(TAG, "Failed to send complete SMS to queue.");
+                        } else {
+                            ESP_LOGI(TAG, "Complete SMS sent to processing queue.");
                         }
                     }
+                } else if (parse_result == ESP_ERR_INVALID_STATE) {
+                    // 这是一个片段,已存储,等待更多片段
+                    ESP_LOGD(TAG, "SMS fragment processed, waiting for more fragments.");
+                } else {
+                    ESP_LOGW(TAG, "Failed to parse SMS URC.");
                 }
+
                 cmt_ptr[urc_len] = temp_char; // Restore original char
                 return (cmt_ptr - urc_line_buffer) + urc_len; // Return total length processed from buffer start
             }
@@ -671,4 +729,149 @@ static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, si
     }
     ESP_LOGD(TAG, "decode_ucs2_hex_to_utf8: Decoded %d UTF-8 bytes from %d hex chars", utf8_idx, ucs2_hex_len);
     utf8_buf[utf8_idx] = '\0'; // Null-terminate
+}
+
+// ==================== SMS分段拼接相关函数实现 ====================
+
+/**
+ * @brief 检查分段缓冲区是否超时
+ * @return true if timeout, false otherwise
+ */
+static bool is_fragment_timeout(void) {
+    if (!s_fragment_buffer.is_active) {
+        return false;
+    }
+
+    TickType_t current_time = xTaskGetTickCount();
+    TickType_t elapsed = current_time - s_fragment_buffer.last_fragment_time;
+
+    // 转换为毫秒并检查是否超时
+    if ((elapsed * portTICK_PERIOD_MS) > SMS_FRAGMENT_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "SMS fragment buffer timeout after %d ms, discarding %d fragments from sender '%s'",
+                 (int)(elapsed * portTICK_PERIOD_MS), s_fragment_buffer.fragment_count, s_fragment_buffer.sender);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief 重置分段缓冲区
+ */
+static void reset_fragment_buffer(void) {
+    memset(&s_fragment_buffer, 0, sizeof(s_fragment_buffer));
+    s_fragment_buffer.is_active = false;
+    ESP_LOGD(TAG, "SMS fragment buffer reset");
+}
+
+/**
+ * @brief 处理SMS分段,累积并在完成时返回完整消息
+ *
+ * @param sender 发件人号码
+ * @param content_hex SMS内容的hex字符串
+ * @param content_hex_len hex字符串长度
+ * @param complete_sms 输出参数:完整的SMS消息(仅在返回ESP_OK时有效)
+ * @return ESP_OK 如果完整SMS已组装完成
+ *         ESP_ERR_INVALID_STATE 如果这是一个片段,需要等待更多片段
+ *         ESP_FAIL 如果处理失败
+ */
+static esp_err_t process_sms_fragment(const char *sender, const char *content_hex, int content_hex_len, sms_message_t *complete_sms) {
+    if (!sender || !content_hex || !complete_sms) {
+        return ESP_FAIL;
+    }
+
+    // 检查是否超时,如果超时则重置缓冲区
+    if (is_fragment_timeout()) {
+        reset_fragment_buffer();
+    }
+
+    // 判断这是否是一个可能的分段SMS (内容较长)
+    bool is_likely_fragment = (content_hex_len >= SMS_FRAGMENT_THRESHOLD);
+
+    ESP_LOGD(TAG, "process_sms_fragment: sender='%s', len=%d, is_likely_fragment=%d, buffer_active=%d",
+             sender, content_hex_len, is_likely_fragment, s_fragment_buffer.is_active);
+
+    // 场景1: 如果缓冲区是空的
+    if (!s_fragment_buffer.is_active) {
+        if (is_likely_fragment) {
+            // 这可能是第一个分段,开始累积
+            ESP_LOGI(TAG, "Starting SMS fragment accumulation from sender '%s' (fragment 1, len=%d)", sender, content_hex_len);
+            strncpy(s_fragment_buffer.sender, sender, sizeof(s_fragment_buffer.sender) - 1);
+            strncpy(s_fragment_buffer.accumulated_content, content_hex, sizeof(s_fragment_buffer.accumulated_content) - 1);
+            s_fragment_buffer.last_fragment_time = xTaskGetTickCount();
+            s_fragment_buffer.fragment_count = 1;
+            s_fragment_buffer.is_active = true;
+
+            return ESP_ERR_INVALID_STATE; // 需要等待更多片段
+        } else {
+            // 这是一个普通的短SMS,直接处理
+            ESP_LOGD(TAG, "Processing short SMS (len=%d), no fragmentation", content_hex_len);
+            strncpy(complete_sms->sender, sender, sizeof(complete_sms->sender) - 1);
+            decode_ucs2_hex_to_utf8(content_hex, complete_sms->content, sizeof(complete_sms->content));
+            return ESP_OK; // 完整消息已准备好
+        }
+    }
+
+    // 场景2: 缓冲区有活跃的分段
+    if (s_fragment_buffer.is_active) {
+        // 检查发件人是否匹配
+        if (strcmp(s_fragment_buffer.sender, sender) == 0) {
+            // 同一发件人,继续累积
+            size_t current_len = strlen(s_fragment_buffer.accumulated_content);
+            size_t remaining_space = sizeof(s_fragment_buffer.accumulated_content) - current_len - 1;
+
+            if (content_hex_len < remaining_space) {
+                strncat(s_fragment_buffer.accumulated_content, content_hex, remaining_space);
+                s_fragment_buffer.fragment_count++;
+                s_fragment_buffer.last_fragment_time = xTaskGetTickCount();
+
+                ESP_LOGI(TAG, "Accumulated SMS fragment %d from '%s' (total_hex_len=%d)",
+                         s_fragment_buffer.fragment_count, sender, (int)strlen(s_fragment_buffer.accumulated_content));
+
+                // 判断是否是最后一个分段 (较短的片段通常是最后一段)
+                if (!is_likely_fragment) {
+                    // 这个片段较短,可能是最后一段
+                    ESP_LOGI(TAG, "Detected final SMS fragment (len=%d < threshold), completing message with %d fragments",
+                             content_hex_len, s_fragment_buffer.fragment_count);
+
+                    // 组装完整消息
+                    strncpy(complete_sms->sender, s_fragment_buffer.sender, sizeof(complete_sms->sender) - 1);
+                    decode_ucs2_hex_to_utf8(s_fragment_buffer.accumulated_content, complete_sms->content, sizeof(complete_sms->content));
+
+                    // 重置缓冲区
+                    reset_fragment_buffer();
+
+                    return ESP_OK; // 完整消息已准备好
+                } else {
+                    // 还需要等待更多片段
+                    return ESP_ERR_INVALID_STATE;
+                }
+            } else {
+                ESP_LOGE(TAG, "SMS fragment buffer overflow! Accumulated: %d, New: %d, Max: %d",
+                         (int)current_len, content_hex_len, (int)sizeof(s_fragment_buffer.accumulated_content));
+
+                // 缓冲区溢出,尝试用已有内容组装消息
+                strncpy(complete_sms->sender, s_fragment_buffer.sender, sizeof(complete_sms->sender) - 1);
+                decode_ucs2_hex_to_utf8(s_fragment_buffer.accumulated_content, complete_sms->content, sizeof(complete_sms->content));
+
+                reset_fragment_buffer();
+                return ESP_OK; // 返回部分消息
+            }
+        } else {
+            // 不同发件人,说明之前的分段SMS已经结束(可能没收到最后一段)
+            ESP_LOGW(TAG, "New SMS from different sender '%s' while fragments from '%s' are pending. Flushing old fragments.",
+                     sender, s_fragment_buffer.sender);
+
+            // 先用旧的片段组装消息
+            strncpy(complete_sms->sender, s_fragment_buffer.sender, sizeof(complete_sms->sender) - 1);
+            decode_ucs2_hex_to_utf8(s_fragment_buffer.accumulated_content, complete_sms->content, sizeof(complete_sms->content));
+
+            // 重置并开始新的片段累积(如果需要)
+            reset_fragment_buffer();
+
+            // 递归处理新的SMS
+            return process_sms_fragment(sender, content_hex, content_hex_len, complete_sms);
+        }
+    }
+
+    return ESP_FAIL;
 }
