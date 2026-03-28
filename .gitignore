@@ -1,0 +1,18 @@
+# Build output
+build/
+
+# ESP-IDF generated config (contains Wi-Fi passwords, broker URIs, etc.)
+# Use sdkconfig.defaults for shared defaults, generate sdkconfig via `idf.py menuconfig`
+sdkconfig
+sdkconfig.old
+
+# IDE / editor
+.vscode/
+.idea/
+
+# clangd cache
+.cache/
+
+# Syncthing
+.stignore
+.stfolder/
