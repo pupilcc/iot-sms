@@ -80,7 +80,7 @@ typedef struct {
 
 All settings under `Application Configuration` menu:
 - Wi-Fi SSID/password
-- UART port, TX/RX pins (default: UART1, GPIO21/GPIO20), baud rate (default: 115200)
+- UART port, TX/RX pins (default: UART1, GPIO0/GPIO1), baud rate (default: 115200)
 - MQTT broker URI and SMS topic
 - SIM phone number (optional)
 - Timezone in POSIX format (default: UTC0)

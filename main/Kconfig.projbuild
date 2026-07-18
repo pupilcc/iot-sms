@@ -37,15 +37,17 @@ menu "Application Configuration"
 
     config APP_UART_TXD
         int "UART TXD Pin for 4G Modem"
-        default 21
+        default 0
         help
             GPIO pin for UART TX (connects to 4G modem RX).
+            Avoid GPIO21/GPIO20, which are the ESP32-C3 UART0 console default pins.
 
     config APP_UART_RXD
         int "UART RXD Pin for 4G Modem"
-        default 20
+        default 1
         help
             GPIO pin for UART RX (connects to 4G modem TX).
+            Avoid GPIO21/GPIO20, which are the ESP32-C3 UART0 console default pins.
 
     config APP_UART_BAUD_RATE
         int "UART Baud Rate for 4G Modem"

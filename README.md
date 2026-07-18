@@ -17,8 +17,66 @@ An ESP-IDF firmware for ESP32-C3 that receives SMS messages via a 4G Cat.1 modem
 ## Hardware Requirements
 
 - **Microcontroller**: ESP32-C3
-- **Modem**: 4G Cat.1 module with AT command interface (tested with Air724UG)
-- **Connection**: UART between ESP32-C3 and modem (default: TX=GPIO21, RX=GPIO20)
+- **Modem**: 4G Cat.1 module, either with AT command firmware (tested with Air724UG) or Yinerda (银尔达) DTU transparent firmware
+- **Connection**: UART between ESP32-C3 and modem (see below)
+
+### Pin and UART Assignments
+
+| Function | Peripheral | Pins | Parameters |
+|----------|------------|------|------------|
+| 4G modem communication | UART1 (`CONFIG_APP_UART_PORT_NUM`) | TX=GPIO0, RX=GPIO1 (project default) | 115200 baud, 8N1, no flow control |
+| Log console / flashing | UART0 (primary console) | ESP32-C3 default: TX=GPIO21, RX=GPIO20 | 115200 baud |
+| Log console / flashing | USB-Serial-JTAG (secondary console) | GPIO18 (USB D-), GPIO19 (USB D+) | — |
+
+All modem UART settings (port, pins, baud rate) are configurable via `idf.py menuconfig` → **Application Configuration**.
+
+### Wiring
+
+Only three wires are needed between the ESP32-C3 and the modem. With the default
+pin configuration (TX=GPIO0, RX=GPIO1):
+
+```
+ESP32-C3                        4G Cat.1 Modem
+────────                        ──────────────
+GPIO0 (UART1 TX)  ───────────►  RXD (main UART)
+GPIO1 (UART1 RX)  ◄───────────  TXD (main UART)
+GND               ───────────   GND
+```
+
+Steps:
+
+1. **Cross-connect the UART**: ESP32-C3 TX goes to the modem's RXD, and ESP32-C3 RX goes to the modem's TXD. Connect to the modem's *main* UART (the one that accepts AT / DTU commands), not its debug/log UART.
+2. **Connect GND to GND**: a common ground is required, including when the two boards use separate power supplies. Even if both boards are powered from the same power module (which already ties their grounds together), still run a dedicated short GND wire between the two boards, routed alongside the TX/RX wires: it gives the UART signals a low-noise return path, so the modem's high transmit-burst currents stay on its own power ground wire instead of shifting the signal ground reference (which causes intermittent garbled UART data during transmission).
+3. **Check the UART logic level**: the ESP32-C3 uses 3.3V logic. Most 4G dev/DTU boards expose a 3.3V-TTL UART and can be wired directly, but a bare Air724UG module uses 1.8V UART logic and needs a level shifter — check your modem board's documentation.
+4. **Power each board separately**: power the ESP32-C3 via its USB port; power the modem from its own supply as specified by its board (4G transmit bursts draw high current, so the supply should handle ≥2A).
+5. **Insert the SIM card and attach the 4G antenna** before powering the modem on.
+
+When powering both boards from a single power module, each board's 5V **and** GND
+must run back to the power module as a pair — a supply is a complete loop, and each
+board's supply current must return to the module on its own GND wire. The
+board-to-board GND from step 2 is a third, additional wire:
+
+```
+Power module 5V   ────►  ESP32-C3 5V/VIN
+Power module GND  ────►  ESP32-C3 GND      ← supply return for the ESP32-C3
+Power module 5V   ────►  4G modem 5V/VIN
+Power module GND  ────►  4G modem GND      ← supply return for the modem (transmit bursts flow here)
+ESP32-C3 GND      ◄───►  4G modem GND      ← signal ground, routed alongside TX/RX
+```
+
+The power-supply GND wires carry the supply current; the board-to-board GND wire
+ideally carries almost none — it only keeps the two boards' 0V references aligned
+for the UART. Both are required, and neither replaces the other.
+
+If you change the pins in menuconfig, wire according to your configured pins instead.
+
+Notes:
+
+- **Pin conflict with UART0 console**: GPIO21/GPIO20 are the ESP32-C3 UART0 default console pins. If the modem UART is mapped to them, it takes over these pins at startup and UART0 console output stops (logs remain available via the USB-Serial-JTAG secondary console). The project default of TX=GPIO0, RX=GPIO1 avoids this conflict.
+- RTS/CTS hardware flow control is not used; only TX, RX, and GND need to be wired.
+- The firmware does not drive any modem power-key or reset pin — the modem must power up and boot on its own.
+- Avoid ESP32-C3 strapping pins (GPIO2, GPIO8, GPIO9) when choosing custom UART pins.
+- Wi-Fi is provided by the ESP32-C3's internal radio and requires no external pins.
 
 ## Software Requirements
 
@@ -51,8 +109,8 @@ Navigate to **Application Configuration** and set:
 | Wi-Fi SSID | - | Your 2.4GHz Wi-Fi network name |
 | Wi-Fi Password | - | Your Wi-Fi password |
 | UART Port Number | 1 | UART port for modem |
-| UART TXD Pin | GPIO 21 | TX pin (connects to modem RX) |
-| UART RXD Pin | GPIO 20 | RX pin (connects to modem TX) |
+| UART TXD Pin | GPIO 0 | TX pin (connects to modem RX) |
+| UART RXD Pin | GPIO 1 | RX pin (connects to modem TX) |
 | UART Baud Rate | 115200 | Baud rate for modem communication |
 | MQTT Broker URI | `mqtt://broker.emqx.io:1883` | Your MQTT broker address |
 | MQTT Topic for SMS | `esp32/sms` | Topic for publishing SMS messages |
