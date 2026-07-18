@@ -77,4 +77,48 @@ menu "Application Configuration"
         help
             Timezone string in POSIX format (e.g., "UTC0" for UTC, "CST-8" for China Standard Time UTC+8, "EST5EDT,M3.2.0/2,M11.1.0" for US Eastern Time).
 
+    config APP_DEVICE_NAME
+        string "Device Name"
+        default ""
+        help
+            Custom identifier for this device (e.g., "sms-gw-01"), used as the
+            "device" field/label in remote logs and metrics. Leave empty to
+            fall back to an ID derived from the Wi-Fi MAC (esp32c3-xxxxxx).
+
+    config APP_REMOTE_LOG_ENABLE
+        bool "Enable remote log forwarding over MQTT"
+        default y
+        help
+            Forward ESP_LOG output to the MQTT broker in JSON batches.
+            Local console logging is unaffected.
+
+    config APP_MQTT_TOPIC_LOG
+        string "MQTT Topic for log batches"
+        depends on APP_REMOTE_LOG_ENABLE
+        default "esp32/log"
+        help
+            MQTT topic to publish batched log lines (QoS 0).
+
+    config APP_REMOTE_LOG_LEVEL
+        int "Remote log minimum level (1=ERROR 2=WARN 3=INFO 4=DEBUG 5=VERBOSE)"
+        depends on APP_REMOTE_LOG_ENABLE
+        range 1 5
+        default 4
+        help
+            Only log lines at this level or more severe are forwarded remotely.
+            Local console logging is unaffected. Note that levels above
+            CONFIG_LOG_MAXIMUM_LEVEL are compiled out and can never be forwarded.
+
+    config APP_MQTT_TOPIC_METRICS
+        string "MQTT Topic for device metrics"
+        default "esp32/metrics"
+        help
+            MQTT topic to publish periodic device metrics (QoS 0).
+
+    config APP_METRICS_INTERVAL_S
+        int "Device metrics publish interval (seconds)"
+        default 60
+        help
+            Interval between device metrics publications.
+
 endmenu

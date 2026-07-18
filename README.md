@@ -59,6 +59,27 @@ Navigate to **Application Configuration** and set:
 | SIM Phone Number | (empty) | Local SIM number (optional, included in MQTT payload) |
 | Timezone | `UTC0` | POSIX timezone string (e.g., `CST-8` for UTC+8) |
 
+#### Remote Logging and Metrics
+
+The remote logging task forwards local `ESP_LOG` output in JSON batches and
+publishes device metrics through the same MQTT connection. Configure these
+options under **Application Configuration**:
+
+| Kconfig option | Default | Description |
+|----------------|---------|-------------|
+| `CONFIG_APP_DEVICE_NAME` | (empty) | Device identifier included in the `device` field of log and metrics messages. When empty, the firmware derives an ID in the form `esp32c3-xxxxxx` from the Wi-Fi MAC address. |
+| `CONFIG_APP_REMOTE_LOG_ENABLE` | `y` | Enables the remote logging and metrics task. Disabling it stops both MQTT log forwarding and metrics publishing; serial console logging is not affected. |
+| `CONFIG_APP_MQTT_TOPIC_LOG` | `esp32/log` | MQTT topic used for batched log messages. Messages are published with QoS 0. This option is available when remote logging is enabled. |
+| `CONFIG_APP_REMOTE_LOG_LEVEL` | `4` (`DEBUG`) | Most verbose log level forwarded remotely: `1=ERROR`, `2=WARN`, `3=INFO`, `4=DEBUG`, `5=VERBOSE`. The selected level and all more severe levels are forwarded. |
+| `CONFIG_APP_MQTT_TOPIC_METRICS` | `esp32/metrics` | MQTT topic used for device metrics. Messages are published with QoS 0. |
+| `CONFIG_APP_METRICS_INTERVAL_S` | `60` | Metrics publishing interval in seconds. Set it to a positive integer. The first metrics message is attempted about 5 seconds after the task starts. |
+
+`CONFIG_LOG_MAXIMUM_LEVEL` is the compile-time ceiling for all logging. It must
+be at least as verbose as `CONFIG_APP_REMOTE_LOG_LEVEL`; otherwise, more verbose
+messages are compiled out and cannot be forwarded. The supplied
+`sdkconfig.defaults` sets the ceiling to `DEBUG`. Set both options to `VERBOSE`
+if verbose logs need to be forwarded.
+
 ### 3. Build and Flash
 
 ```bash

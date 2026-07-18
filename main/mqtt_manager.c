@@ -202,6 +202,18 @@ bool mqtt_manager_is_connected(void) {
     return s_mqtt_connected;
 }
 
+esp_err_t mqtt_manager_publish(const char *topic, const char *payload, int len, int qos) {
+    // 此函数在日志转发热路径上被调用，内部不得使用 ESP_LOG，否则会产生日志回环
+    if (!s_mqtt_connected || !s_mqtt_client) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, payload, len, qos, 0);
+    if (msg_id == -1) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t mqtt_manager_publish_device_ready(const char *operator_name) {
     if (!s_mqtt_client) {
         ESP_LOGE(TAG, "MQTT client not initialized.");

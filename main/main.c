@@ -16,6 +16,7 @@
 #include "mqtt_manager.h"
 #include "sms_processor.h"
 #include "sntp_manager.h"
+#include "remote_log.h"
 
 static const char *TAG = "app_main";
 
@@ -35,6 +36,13 @@ void app_main(void)
     esp_log_level_set("uart_dtu_manager", ESP_LOG_DEBUG);
     esp_log_level_set("mqtt_manager", ESP_LOG_INFO);
     esp_log_level_set("sms_processor", ESP_LOG_INFO);
+    esp_log_level_set("remote_log", ESP_LOG_INFO);
+
+    // Install remote log hook early so boot logs are buffered and
+    // flushed to MQTT once the connection is up
+    if (remote_log_early_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to init remote log, continuing without it.");
+    }
 
     // Initialize NVS (Non-Volatile Storage) for Wi-Fi credentials
     esp_err_t ret = nvs_flash_init();
@@ -78,6 +86,11 @@ void app_main(void)
     // 4. Start MQTT client
     ESP_LOGI(TAG, "Starting MQTT client...");
     mqtt_manager_start();
+
+    // Start log forwarder / metrics task (prio 3, below sms_processor)
+    if (remote_log_start(g_sms_queue) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start remote log task, continuing without it.");
+    }
 
     // 5. Create SMS processor task
     ESP_LOGI(TAG, "Creating SMS processor task...");
