@@ -49,10 +49,11 @@ There are no unit tests or linting tools configured for this project.
 - **wifi_manager** — Blocking Wi-Fi STA connection with retry.
 - **uart_at_manager** — UART communication with modem. Sends AT commands synchronously with timeout. Handles `+CMT` URCs for incoming SMS. Parses both GSM 7-bit and UCS2 (UTF-16BE→UTF-8) encoding. Detects SIM operator via IMSI lookup (`s_operator_map`). Runs two internal tasks: `uart_event_task` (UART data collection) and `uart_at_task` (AT command/URC processing).
 - **uart_dtu_manager** — Alternative to uart_at_manager for modems running Yinerda (银尔达) DTU transparent firmware. Selected via `APP_MODEM_FIRMWARE` Kconfig choice. Enables SMS with `config,set,smson,1,0,0,0,0,1,1`, parses `config,sms,ok,<number>,<UTF-8 hex>` lines (unsolicited reports and `config,get,sms` polling every 10s), detects operator via ICCID prefix (`s_iccid_operator_map`), dedupes repeated deliveries (report + cache polling) by sender+content fingerprint within a 10-min window. Single task: `uart_dtu_task`.
-- **mqtt_manager** — MQTT client. `mqtt_manager_publish_sms()` publishes SMS as JSON. `mqtt_manager_publish_device_ready()` sends a ready message with operator info to `esp32/drive` topic.
+- **mqtt_manager** — MQTT client. `mqtt_manager_publish_sms()` publishes SMS as JSON. `mqtt_manager_publish_device_ready()` sends a ready message with operator info to `esp32/device` topic.
 - **sms_processor** — Reads from SMS queue, publishes via MQTT. Non-blocking retry mechanism (3 attempts, 10s interval). On exhausted retries, persists to NVS via sms_storage. On startup, retries any SMS stored from previous sessions.
 - **sms_storage** — NVS-backed persistence for failed SMS messages. FIFO queue in NVS namespace `sms_failed`, max 20 messages. Uses blob storage with key shifting on delete.
 - **sntp_manager** — SNTP time synchronization. Non-critical; initialized last.
+- **remote_log** — Forwards `ESP_LOG` output to MQTT in JSON batches (`CONFIG_APP_MQTT_TOPIC_LOG`, QoS 0) and publishes periodic device metrics (`CONFIG_APP_MQTT_TOPIC_METRICS`, interval `CONFIG_APP_METRICS_INTERVAL_S`). Enabled via `CONFIG_APP_REMOTE_LOG_ENABLE`; serial console logging is unaffected. Runs the `log_fwd` task (created in `remote_log_start()`).
 
 ### Key Data Structure
 
@@ -63,12 +64,13 @@ typedef struct {
 } sms_message_t;
 ```
 
-### Task Configuration (in main.c)
+### Task Configuration
 
-| Task | Priority | Stack |
-|------|----------|-------|
-| `uart_at_task` | 6 | 8192 bytes |
-| `sms_processor_task` | 4 | 10240 bytes |
+| Task | Priority | Stack | Created in |
+|------|----------|-------|------------|
+| `uart_at_task` (AT firmware) or `uart_dtu_task` (DTU firmware) | 6 | 8192 bytes | main.c |
+| `sms_processor_task` | 4 | 10240 bytes | main.c |
+| `log_fwd` | 3 | 4096 bytes | remote_log.c (`remote_log_start()`) |
 
 ### Concurrency
 

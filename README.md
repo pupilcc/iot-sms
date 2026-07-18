@@ -4,12 +4,13 @@ An ESP-IDF firmware for ESP32-C3 that receives SMS messages via a 4G Cat.1 modem
 
 ## Features
 
-- Receives SMS through 4G Cat.1 modem via UART AT commands
+- Receives SMS through 4G Cat.1 modem via UART, supporting both standard AT command firmware and Yinerda (银尔达) DTU transparent firmware (selectable in menuconfig)
 - Publishes SMS to configurable MQTT broker as JSON (with sender, content, operator, local number, timestamp)
 - Handles UCS2 encoded SMS (Chinese, Arabic, etc.) with automatic UTF-8 conversion
 - Supports long SMS reassembly (concatenated SMS fragments up to ~4-5 segments)
 - NVS-based SMS persistence: failed publishes are saved to flash and retried on reconnect or reboot
-- Automatic SIM operator detection via IMSI lookup
+- Automatic SIM operator detection (IMSI lookup in AT mode, ICCID prefix in DTU mode)
+- Remote logging and device metrics: forwards `ESP_LOG` output in JSON batches and publishes periodic metrics over MQTT
 - SNTP time synchronization for accurate message timestamps
 - Publishes device ready status to `esp32/device` topic on startup
 - FreeRTOS-based concurrent task architecture
@@ -106,6 +107,7 @@ Navigate to **Application Configuration** and set:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| 4G Modem Firmware Type | AT firmware | Firmware on the modem: standard AT commands, or Yinerda (银尔达) DTU transparent firmware |
 | Wi-Fi SSID | - | Your 2.4GHz Wi-Fi network name |
 | Wi-Fi Password | - | Your Wi-Fi password |
 | UART Port Number | 1 | UART port for modem |
@@ -157,6 +159,7 @@ Exit monitor with `Ctrl+]`.
 │    ├── wifi_manager ──── Wi-Fi STA connection             │
 │    ├── sntp_manager ──── Time sync (NTP)                  │
 │    ├── uart_at_manager ── AT commands / SMS parsing       │
+│    │   (or uart_dtu_manager for Yinerda DTU firmware)     │
 │    │        │                                             │
 │    │        ▼                                             │
 │    │   SMS Queue (FreeRTOS, capacity: 10)                 │
@@ -166,6 +169,7 @@ Exit monitor with `Ctrl+]`.
 │    │        │                                             │
 │    │        ├── mqtt_manager ── MQTT publish               │
 │    │        └── sms_storage ─── NVS persistence (max 20)  │
+│    ├── remote_log ────── Log forwarding + metrics (MQTT)  │
 │    └── mqtt_manager ──── MQTT client + device ready msg   │
 └──────────────────────────────────────────────────────────┘
          │ UART
@@ -207,7 +211,7 @@ When MQTT publish fails:
 
 ## Supported Operators
 
-Operator detection is automatic via IMSI prefix lookup:
+Operator detection is automatic. With AT firmware, the operator is resolved via IMSI prefix lookup:
 
 | Country | Operator | MCC/MNC Prefixes |
 |---------|----------|-----------------|
@@ -220,6 +224,10 @@ Operator detection is automatic via IMSI prefix lookup:
 | HK | Haha | 45403 |
 
 Add new operators in `s_operator_map` array in `main/uart_at_manager.c`.
+
+With Yinerda DTU firmware, the operator is resolved via ICCID prefix lookup instead
+(`s_iccid_operator_map` array in `main/uart_dtu_manager.c`), which currently covers
+the mainland China operators only.
 
 ## Troubleshooting
 
@@ -237,7 +245,8 @@ Add new operators in `s_operator_map` array in `main/uart_at_manager.c`.
 - Ensure SIM card has SMS service activated
 - Set log level to DEBUG/VERBOSE for AT command diagnostics:
   ```c
-  esp_log_level_set("uart_at_manager", ESP_LOG_VERBOSE);
+  esp_log_level_set("uart_at_manager", ESP_LOG_VERBOSE);   // AT firmware
+  esp_log_level_set("uart_dtu_manager", ESP_LOG_VERBOSE);  // Yinerda DTU firmware
   ```
 - Send a test SMS to the SIM card number
 
@@ -248,9 +257,9 @@ Add new operators in `s_operator_map` array in `main/uart_at_manager.c`.
 
 ## Known Limitations
 
-- SMS text mode only (`AT+CMGF=1`), PDU mode not supported
+- AT firmware mode: SMS text mode only (`AT+CMGF=1`), PDU mode not supported
 - MQTT broker authentication not implemented
-- Only processes unsolicited SMS notifications (no polling/reading stored SMS)
+- AT firmware mode only processes unsolicited SMS notifications (no polling/reading of stored SMS); DTU mode additionally polls the modem's SMS cache every 10 seconds
 - Wi-Fi connection failure at startup halts the application
 - Queue capacity: 10 SMS in memory, 20 in NVS persistence
 
