@@ -156,14 +156,17 @@ static void uart_event_task(void *pvParameters) {
                         ESP_LOGD(TAG, "Current RX buffer: %s", s_uart_rx_buffer); // Log current buffer content for debugging
 
                         // 清理非SMS相关的URC消息,避免缓冲区堆积
-                        // 只保留AT命令响应和+CMT消息
+                        // 保留AT命令响应、扩展错误响应和+CMT消息
                         char *buffer_ptr = s_uart_rx_buffer;
                         while (*buffer_ptr) {
                             // 检查是否是需要忽略的URC (不是+CMT的其他URC)
                             if (*buffer_ptr == '+' || *buffer_ptr == '^') {
-                                // 检查是否是+CMT (需要保留)
-                                if (strncmp(buffer_ptr, "+CMT:", 5) == 0) {
-                                    // 这是+CMT消息,跳过这一行以保留它
+                                // +CME ERROR/+CMS ERROR是AT命令的终止响应，不是普通URC
+                                bool should_preserve_line = strncmp(buffer_ptr, "+CMT:", 5) == 0 ||
+                                                            strncmp(buffer_ptr, "+CME ERROR:", 11) == 0 ||
+                                                            strncmp(buffer_ptr, "+CMS ERROR:", 11) == 0;
+                                if (should_preserve_line) {
+                                    // 跳过这一行以保留它
                                     char *line_end = strstr(buffer_ptr, "\r\n");
                                     if (line_end) {
                                         buffer_ptr = line_end + 2;
@@ -198,11 +201,13 @@ static void uart_event_task(void *pvParameters) {
                         // Check for URCs or command responses in the buffer
                         char *ok_pos = strstr(s_uart_rx_buffer, "OK\r\n");
                         char *error_pos = strstr(s_uart_rx_buffer, "ERROR\r\n");
+                        char *cme_error_pos = strstr(s_uart_rx_buffer, "+CME ERROR:");
+                        char *cms_error_pos = strstr(s_uart_rx_buffer, "+CMS ERROR:");
                         char *prompt_pos = strstr(s_uart_rx_buffer, "> "); // For CMGS prompt
 
                         if (ok_pos) {
                             xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_OK_BIT);
-                        } else if (error_pos || prompt_pos) {
+                        } else if (error_pos || cme_error_pos || cms_error_pos || prompt_pos) {
                             xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_ERROR_BIT);
                         }
 
@@ -292,10 +297,14 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
         ESP_LOGD(TAG, "AT command response (OK): %s", response_buffer);
         return ESP_OK;
     } else if (uxBits & AT_RESPONSE_ERROR_BIT) {
-        ESP_LOGW(TAG, "AT command response (ERROR/PROMPT): %s", response_buffer);
+        ESP_LOGW(TAG, "AT command failed: %s, response: %s", cmd, response_buffer);
         return ESP_FAIL;
     } else {
-        ESP_LOGE(TAG, "AT command timeout for: %s", cmd);
+        if (response_buffer[0] != '\0') {
+            ESP_LOGE(TAG, "AT command timeout for: %s, partial response: %s", cmd, response_buffer);
+        } else {
+            ESP_LOGE(TAG, "AT command timeout for: %s (no response received)", cmd);
+        }
         return ESP_FAIL;
     }
 }
@@ -609,20 +618,26 @@ void uart_at_task(void *pvParameters) {
     }
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 3. Set SMS to text mode (AT+CMGF=1) - Sticking to text mode for now to avoid PDU decoding complexity
+    // 3. Enable verbose modem errors so initialization failures include their real cause
+    if (at_send_command("AT+CMEE=2", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to enable verbose modem errors (AT+CMEE=2). Continuing with default error reporting.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 4. Set SMS to text mode (AT+CMGF=1) - Sticking to text mode for now to avoid PDU decoding complexity
     if (at_send_command("AT+CMGF=1", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set SMS to text mode (AT+CMGF=1).");
         vTaskDelete(NULL);
     }
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 4. Set character set to UCS2 (AT+CSCS="UCS2") - Important for Chinese characters
+    // 5. Set character set to UCS2 (AT+CSCS="UCS2") - Important for Chinese characters
     if (at_send_command("AT+CSCS=\"UCS2\"", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set character set to UCS2 (AT+CSCS=\"UCS2\"). SMS might be garbled.");
     }
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 5. Configure new SMS message indications (AT+CNMI=2,2,0,0,0) - Direct URC, no storage
+    // 6. Configure new SMS message indications (AT+CNMI=2,2,0,0,0) - Direct URC, no storage
     if (at_send_command("AT+CNMI=2,2,0,0,0", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure new SMS indications (AT+CNMI).");
         vTaskDelete(NULL);
@@ -631,7 +646,7 @@ void uart_at_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // --- 新增：获取SIM卡运营商和本机号码 ---
-    // 6. 获取SIM卡运营商
+    // 7. 获取SIM卡运营商
     if (get_sim_operator_name(g_sim_operator, sizeof(g_sim_operator)) != ESP_OK) {
         ESP_LOGW(TAG, "Could not determine SIM operator.");
     }
@@ -639,7 +654,7 @@ void uart_at_task(void *pvParameters) {
 
     ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
 
-    // 7. 发送设备就绪消息到 MQTT
+    // 8. 发送设备就绪消息到 MQTT
     ESP_LOGI(TAG, "Publishing device ready message to MQTT...");
     if (mqtt_manager_publish_device_ready(g_sim_operator) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to publish device ready message.");

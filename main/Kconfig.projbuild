@@ -1,5 +1,21 @@
 menu "Application Configuration"
 
+    choice APP_MODEM_FIRMWARE
+        prompt "4G Modem Firmware Type"
+        default APP_MODEM_FIRMWARE_AT
+        help
+            Firmware type running on the 4G Cat.1 modem.
+            AT firmware: standard AT command interface (+CMT URC for SMS).
+            Yinerda DTU firmware: transparent firmware using "config,xxx"
+            serial commands (SMS reported as config,sms,ok,<number>,<UTF-8 hex>).
+
+        config APP_MODEM_FIRMWARE_AT
+            bool "AT firmware"
+
+        config APP_MODEM_FIRMWARE_DTU
+            bool "Yinerda DTU firmware"
+    endchoice
+
     config APP_WIFI_SSID
         string "WiFi SSID"
         default "YOUR_WIFI_SSID"

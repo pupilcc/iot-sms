@@ -12,6 +12,7 @@
 // Include our custom modules
 #include "wifi_manager.h"
 #include "uart_at_manager.h"
+#include "uart_dtu_manager.h"
 #include "mqtt_manager.h"
 #include "sms_processor.h"
 #include "sntp_manager.h"
@@ -31,6 +32,7 @@ void app_main(void)
     esp_log_level_set("*", ESP_LOG_DEBUG);
     esp_log_level_set("wifi_manager", ESP_LOG_INFO);
     esp_log_level_set("uart_at_manager", ESP_LOG_DEBUG); // Set to VERBOSE for detailed AT command logs
+    esp_log_level_set("uart_dtu_manager", ESP_LOG_DEBUG);
     esp_log_level_set("mqtt_manager", ESP_LOG_INFO);
     esp_log_level_set("sms_processor", ESP_LOG_INFO);
 
@@ -62,10 +64,16 @@ void app_main(void)
         while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
-    // 3. Initialize UART AT manager and create its task
+    // 3. Initialize UART manager (AT or DTU firmware) and create its task
+#if CONFIG_APP_MODEM_FIRMWARE_DTU
+    ESP_LOGI(TAG, "Initializing UART DTU manager...");
+    ESP_ERROR_CHECK(uart_dtu_init(g_sms_queue));
+    xTaskCreate(uart_dtu_task, "uart_dtu_task", 8192, NULL, 6, NULL);
+#else
     ESP_LOGI(TAG, "Initializing UART AT manager...");
     ESP_ERROR_CHECK(uart_at_init(g_sms_queue));
     xTaskCreate(uart_at_task, "uart_at_task", 8192, NULL, 6, NULL); // 8KB stack for SMS fragment processing (sms_message_t is 2KB)
+#endif
 
     // 4. Start MQTT client
     ESP_LOGI(TAG, "Starting MQTT client...");
