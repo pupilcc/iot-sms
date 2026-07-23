@@ -23,6 +23,7 @@
 #define BUF_SIZE (4096)  // Increased from 1024 to handle long SMS and burst URCs
 #define AT_RESPONSE_MAX_LEN 1024  // Increased from 512 for longer responses
 #define AT_COMMAND_TIMEOUT_MS 10000 // 10 seconds for AT commands, increased for robustness
+#define AT_PROBE_MAX_RETRIES 3
 static const char *TAG = "uart_at_manager";
 static QueueHandle_t s_sms_queue = NULL;
 static QueueHandle_t s_uart_event_queue = NULL; // Declare event queue handle
@@ -61,6 +62,10 @@ static sms_fragment_buffer_t s_fragment_buffer = {0};
 // Forward declarations
 static int handle_urc(char *urc_line_buffer);
 static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t buffer_size, TickType_t timeout_ticks);
+static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_size,
+                                         bool *modem_responding);
+static void process_pending_sms_urcs(void);
+static void wait_for_recovery_retry(TickType_t delay_ticks);
 static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_t *sms_msg);
 static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, size_t utf8_buf_len);
 
@@ -258,6 +263,78 @@ static void uart_event_task(void *pvParameters) {
 }
 
 
+static bool has_complete_sms_urc_locked(void) {
+    char *cmt_pos = strstr(s_uart_rx_buffer, "+CMT:");
+    if (cmt_pos == NULL) {
+        return false;
+    }
+
+    char *first_crlf = strstr(cmt_pos, "\r\n");
+    return first_crlf != NULL && strstr(first_crlf + 2, "\r\n") != NULL;
+}
+
+static void process_pending_sms_urcs_locked(void) {
+    int processed_len;
+
+    do {
+        processed_len = handle_urc(s_uart_rx_buffer);
+        if (processed_len > 0) {
+            memmove(s_uart_rx_buffer,
+                    s_uart_rx_buffer + processed_len,
+                    s_uart_rx_buffer_idx - processed_len + 1);
+            s_uart_rx_buffer_idx -= processed_len;
+            ESP_LOGD(TAG, "Buffer after URC processing: %s", s_uart_rx_buffer);
+        }
+    } while (processed_len > 0 && s_uart_rx_buffer_idx > 0);
+
+    if (has_complete_sms_urc_locked()) {
+        xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_URC_BIT);
+    } else {
+        xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_URC_BIT);
+    }
+}
+
+static void process_pending_sms_urcs(void) {
+    xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
+    process_pending_sms_urcs_locked();
+    xSemaphoreGive(s_uart_rx_mutex);
+}
+
+static void clear_command_data_preserving_sms_locked(void) {
+    char *cmt_start = strstr(s_uart_rx_buffer, "+CMT:");
+
+    if (cmt_start != NULL) {
+        int preserved_len = s_uart_rx_buffer_idx - (int)(cmt_start - s_uart_rx_buffer);
+        memmove(s_uart_rx_buffer, cmt_start, preserved_len);
+        s_uart_rx_buffer_idx = preserved_len;
+        s_uart_rx_buffer[s_uart_rx_buffer_idx] = '\0';
+        ESP_LOGD(TAG, "Preserved %d bytes of an incomplete SMS URC", s_uart_rx_buffer_idx);
+    } else {
+        s_uart_rx_buffer_idx = 0;
+        s_uart_rx_buffer[0] = '\0';
+    }
+}
+
+static void wait_for_recovery_retry(TickType_t delay_ticks) {
+    TickType_t start_time = xTaskGetTickCount();
+
+    while (xTaskGetTickCount() - start_time < delay_ticks) {
+        TickType_t elapsed = xTaskGetTickCount() - start_time;
+        TickType_t remaining = delay_ticks - elapsed;
+        EventBits_t bits = xEventGroupWaitBits(s_at_response_event_group,
+                                               AT_RESPONSE_URC_BIT,
+                                               pdTRUE,
+                                               pdFALSE,
+                                               remaining);
+        if (bits & AT_RESPONSE_URC_BIT) {
+            process_pending_sms_urcs();
+        } else {
+            break;
+        }
+    }
+}
+
+
 /**
  * @brief Sends an AT command and waits for a response.
  *
@@ -271,11 +348,13 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
     ESP_LOGD(TAG, "Sending AT command: %s", cmd);
 
     xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
-    s_uart_rx_buffer_idx = 0; // Clear buffer for new command
-    s_uart_rx_buffer[0] = '\0';
+    // Process complete SMS reports first. If a report is still arriving, keep
+    // it in the buffer instead of discarding it for the command transaction.
+    process_pending_sms_urcs_locked();
+    clear_command_data_preserving_sms_locked();
     xSemaphoreGive(s_uart_rx_mutex);
 
-    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT | AT_RESPONSE_URC_BIT); // Clear URC bit too
+    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT);
 
     uart_write_bytes(UART_PORT_NUM, cmd, strlen(cmd));
     uart_write_bytes(UART_PORT_NUM, "\r\n", 2); // AT commands usually end with CR+LF
@@ -289,8 +368,8 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
     xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
     strncpy(response_buffer, s_uart_rx_buffer, buffer_size - 1);
     response_buffer[buffer_size - 1] = '\0';
-    s_uart_rx_buffer_idx = 0; // Clear buffer after copying
-    s_uart_rx_buffer[0] = '\0';
+    process_pending_sms_urcs_locked();
+    clear_command_data_preserving_sms_locked();
     xSemaphoreGive(s_uart_rx_mutex);
 
     if (uxBits & AT_RESPONSE_OK_BIT) {
@@ -552,10 +631,84 @@ static esp_err_t get_sim_operator_name(char *operator_buffer, size_t buffer_size
     return ESP_FAIL;
 }
 
+static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_size,
+                                         bool *modem_responding) {
+    esp_err_t at_result = ESP_FAIL;
+
+    *modem_responding = false;
+
+    // Keep the short startup probe, but let the caller decide how to recover.
+    for (int retry_count = 0; retry_count < AT_PROBE_MAX_RETRIES; retry_count++) {
+        if (retry_count > 0) {
+            ESP_LOGW(TAG, "Retrying AT command (%d/%d)...",
+                     retry_count + 1, AT_PROBE_MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        at_result = at_send_command("AT", response_buffer, buffer_size,
+                                    pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS));
+        if (at_result == ESP_OK) {
+            break;
+        }
+    }
+
+    if (at_result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to communicate with 4G modem after %d attempts.",
+                 AT_PROBE_MAX_RETRIES);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "AT command successful, modem is responding.");
+    *modem_responding = true;
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Non-critical setup commands remain best effort.
+    if (at_send_command("ATE0", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to disable AT command echo. Parsing might be more complex.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (at_send_command("AT+CMEE=2", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to enable verbose modem errors (AT+CMEE=2). Continuing with default error reporting.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // SMS mode and new-message indications are required before declaring ready.
+    if (at_send_command("AT+CMGF=1", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set SMS to text mode (AT+CMGF=1).");
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (at_send_command("AT+CSCS=\"UCS2\"", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set character set to UCS2 (AT+CSCS=\"UCS2\"). SMS might be garbled.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (at_send_command("AT+CNMI=2,2,0,0,0", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure new SMS indications (AT+CNMI).");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "4G modem initialized for SMS reception.");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (get_sim_operator_name(g_sim_operator, sizeof(g_sim_operator)) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not determine SIM operator.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    return ESP_OK;
+}
+
 
 void uart_at_task(void *pvParameters) {
     char response_buffer[AT_RESPONSE_MAX_LEN];
-    // sms_message_t new_sms; // Removed as it's passed to handle_urc
+    static const uint32_t recovery_delays_ms[] = {5000, 10000, 20000, 30000};
+    size_t recovery_delay_index = 0;
 
     // Register this task's handle for cleanup on restart
     s_uart_at_task_handle = xTaskGetCurrentTaskHandle();
@@ -564,13 +717,9 @@ void uart_at_task(void *pvParameters) {
     ESP_LOGI(TAG, "Initializing 4G Cat.1 modem...");
     vTaskDelay(pdMS_TO_TICKS(120000)); // Give modem more time to boot (120 seconds)
 
-    // Flush UART buffers to clear any residual data from previous sessions
-    uart_flush(UART_PORT_NUM);
-    xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
-    s_uart_rx_buffer_idx = 0;
-    s_uart_rx_buffer[0] = '\0';
-    xSemaphoreGive(s_uart_rx_mutex);
-    ESP_LOGI(TAG, "UART buffers flushed, ready for AT commands.");
+    // A modem that survived an ESP32 restart may already be reporting SMS.
+    // Drain those reports before sending wake-up or validation commands.
+    process_pending_sms_urcs();
 
     // Send wake-up sequence to ensure modem is responsive
     // This is important when ESP32 restarts but modem is still running
@@ -580,86 +729,39 @@ void uart_at_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    // Clear any responses from wake-up sequence
     vTaskDelay(pdMS_TO_TICKS(500));
-    uart_flush(UART_PORT_NUM);
-    xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
-    s_uart_rx_buffer_idx = 0;
-    s_uart_rx_buffer[0] = '\0';
-    xSemaphoreGive(s_uart_rx_mutex);
-    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT | AT_RESPONSE_URC_BIT);
+    process_pending_sms_urcs();
     ESP_LOGI(TAG, "Wake-up sequence complete, modem should be responsive.");
 
-    // 1. Test AT command (with retry mechanism)
-    int retry_count = 0;
-    const int max_retries = 3;
-    esp_err_t at_result = ESP_FAIL;
-
-    while (retry_count < max_retries && at_result != ESP_OK) {
-        if (retry_count > 0) {
-            ESP_LOGW(TAG, "Retrying AT command (%d/%d)...", retry_count + 1, max_retries);
-            vTaskDelay(pdMS_TO_TICKS(1000)); // Wait before retry
+    bool modem_responding = false;
+    while (configure_modem_for_sms(response_buffer, sizeof(response_buffer),
+                                   &modem_responding) != ESP_OK) {
+        if (modem_responding) {
+            // Communication recovered; restart the backoff for any remaining
+            // SMS configuration failure.
+            recovery_delay_index = 0;
         }
-        at_result = at_send_command("AT", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS));
-        retry_count++;
+
+        uint32_t retry_delay_ms = recovery_delays_ms[recovery_delay_index];
+        ESP_LOGW(TAG,
+                 "SMS modem is not ready; UART task remains active and will retry in %lu seconds.",
+                 (unsigned long)(retry_delay_ms / 1000));
+        wait_for_recovery_retry(pdMS_TO_TICKS(retry_delay_ms));
+
+        if (!modem_responding &&
+            recovery_delay_index <
+            (sizeof(recovery_delays_ms) / sizeof(recovery_delays_ms[0])) - 1) {
+            recovery_delay_index++;
+        }
     }
 
-    if (at_result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to communicate with 4G modem after %d attempts.", max_retries);
-        // Consider a retry mechanism or reboot here
-        vTaskDelete(NULL);
-    }
-    ESP_LOGI(TAG, "AT command successful, modem is responding.");
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 2. Disable echo (ATE0) - This is important to simplify parsing
-    if (at_send_command("ATE0", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to disable AT command echo. Parsing might be more complex.");
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 3. Enable verbose modem errors so initialization failures include their real cause
-    if (at_send_command("AT+CMEE=2", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to enable verbose modem errors (AT+CMEE=2). Continuing with default error reporting.");
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 4. Set SMS to text mode (AT+CMGF=1) - Sticking to text mode for now to avoid PDU decoding complexity
-    if (at_send_command("AT+CMGF=1", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set SMS to text mode (AT+CMGF=1).");
-        vTaskDelete(NULL);
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 5. Set character set to UCS2 (AT+CSCS="UCS2") - Important for Chinese characters
-    if (at_send_command("AT+CSCS=\"UCS2\"", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set character set to UCS2 (AT+CSCS=\"UCS2\"). SMS might be garbled.");
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 6. Configure new SMS message indications (AT+CNMI=2,2,0,0,0) - Direct URC, no storage
-    if (at_send_command("AT+CNMI=2,2,0,0,0", response_buffer, sizeof(response_buffer), pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure new SMS indications (AT+CNMI).");
-        vTaskDelete(NULL);
-    }
-    ESP_LOGI(TAG, "4G modem initialized for SMS reception.");
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // --- 新增：获取SIM卡运营商和本机号码 ---
-    // 7. 获取SIM卡运营商
-    if (get_sim_operator_name(g_sim_operator, sizeof(g_sim_operator)) != ESP_OK) {
-        ESP_LOGW(TAG, "Could not determine SIM operator.");
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-
+    process_pending_sms_urcs();
     ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
 
-    // 8. 发送设备就绪消息到 MQTT
     ESP_LOGI(TAG, "Publishing device ready message to MQTT...");
     if (mqtt_manager_publish_device_ready(g_sim_operator) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to publish device ready message.");
     }
-    // --- 新增结束 ---
 
     // Main loop to listen for incoming URCs (like +CMT:)
     while (1) {
@@ -671,34 +773,9 @@ void uart_at_task(void *pvParameters) {
                                                  portMAX_DELAY); // Wait indefinitely
 
         if (uxBits & AT_RESPONSE_URC_BIT) {
-            xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
-            ESP_LOGI(TAG, "Received URC from 4G modem: %s", s_uart_rx_buffer);
-
-            // Process URCs one by one from the buffer
-            int processed_len = 0;
-            do {
-                processed_len = handle_urc(s_uart_rx_buffer);
-                if (processed_len > 0) {
-                    // Shift remaining data to the beginning of the buffer
-                    memmove(s_uart_rx_buffer, s_uart_rx_buffer + processed_len, s_uart_rx_buffer_idx - processed_len + 1); // +1 for null terminator
-                    s_uart_rx_buffer_idx -= processed_len;
-                    ESP_LOGD(TAG, "Buffer after URC processing: %s", s_uart_rx_buffer);
-                }
-            } while (processed_len > 0 && s_uart_rx_buffer_idx > 0); // Keep processing if more URCs are in buffer
-
-            // After processing, check if there are still complete URCs in the buffer
-            // This is important if multiple URCs arrived in one go
-            char *cmt_pos = strstr(s_uart_rx_buffer, "+CMT:");
-            if (cmt_pos) {
-                char *first_crlf = strstr(cmt_pos, "\r\n");
-                if (first_crlf && strstr(first_crlf + 2, "\r\n")) {
-                    xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_URC_BIT); // Re-signal if another URC is ready
-                }
-            }
-            xSemaphoreGive(s_uart_rx_mutex);
+            process_pending_sms_urcs();
         }
     }
-    vTaskDelete(NULL);
 }
 
 static int handle_urc(char *urc_line_buffer) { // Now takes a mutable buffer
