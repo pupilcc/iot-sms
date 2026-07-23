@@ -52,6 +52,7 @@ static const iccid_operator_map_t s_iccid_operator_map[] = {
     {"898603", "中国电信"},
     {"898611", "中国电信"},
     {"898615", "中国广电"},
+    {"896405", "Skinny"},  // 新西兰 Skinny(Spark旗下MVNO)
 };
 static const size_t s_iccid_operator_map_size = sizeof(s_iccid_operator_map) / sizeof(s_iccid_operator_map[0]);
 
