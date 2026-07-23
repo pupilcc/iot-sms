@@ -9,6 +9,7 @@
 #include "uart_at_manager.h" // For sms_message_t
 #include "mqtt_manager.h"     // For mqtt_manager_publish_sms
 #include "sms_storage.h"      // For NVS persistence
+#include "log_redaction.h"
 
 static const char *TAG = "sms_processor";
 
@@ -49,7 +50,9 @@ void sms_processor_task(void *pvParameters) {
         if (mqtt_manager_is_connected()) {
             sms_message_t stored_sms;
             while (sms_storage_get_next(&stored_sms) == ESP_OK) {
-                ESP_LOGI(TAG, "Retrying stored SMS from NVS: Sender='%s'", stored_sms.sender);
+                char masked_sender[LOG_MASKED_PHONE_SIZE];
+                ESP_LOGI(TAG, "Retrying stored SMS from NVS: Sender='%s'",
+                         log_mask_phone(stored_sms.sender, masked_sender, sizeof(masked_sender)));
                 if (mqtt_manager_publish_sms(&stored_sms) == ESP_OK) {
                     ESP_LOGI(TAG, "Successfully sent stored SMS, removing from NVS");
                     sms_storage_delete_oldest();
@@ -67,7 +70,10 @@ void sms_processor_task(void *pvParameters) {
                 // Time to retry
                 if (mqtt_manager_is_connected()) {
                     if (mqtt_manager_publish_sms(&s_retry_state.sms) == ESP_OK) {
-                        ESP_LOGI(TAG, "Retry successful for SMS from '%s'", s_retry_state.sms.sender);
+                        char masked_sender[LOG_MASKED_PHONE_SIZE];
+                        ESP_LOGI(TAG, "Retry successful for SMS from '%s'",
+                                 log_mask_phone(s_retry_state.sms.sender, masked_sender,
+                                                sizeof(masked_sender)));
                         s_retry_state.is_active = false;
                     } else {
                         s_retry_state.retry_count++;
@@ -75,8 +81,10 @@ void sms_processor_task(void *pvParameters) {
                             ESP_LOGE(TAG, "Failed to publish SMS after %d attempts, saving to NVS",
                                      max_retry_attempts);
                             if (sms_storage_save(&s_retry_state.sms) != ESP_OK) {
+                                char masked_sender[LOG_MASKED_PHONE_SIZE];
                                 ESP_LOGE(TAG, "Failed to save SMS to NVS, message from '%s' is lost",
-                                         s_retry_state.sms.sender);
+                                         log_mask_phone(s_retry_state.sms.sender, masked_sender,
+                                                        sizeof(masked_sender)));
                             }
                             s_retry_state.is_active = false;
                         } else {
@@ -92,8 +100,10 @@ void sms_processor_task(void *pvParameters) {
                         ESP_LOGE(TAG, "MQTT disconnected after %d attempts, saving SMS to NVS",
                                  max_retry_attempts);
                         if (sms_storage_save(&s_retry_state.sms) != ESP_OK) {
+                            char masked_sender[LOG_MASKED_PHONE_SIZE];
                             ESP_LOGE(TAG, "Failed to save SMS to NVS, message from '%s' is lost",
-                                     s_retry_state.sms.sender);
+                                     log_mask_phone(s_retry_state.sms.sender, masked_sender,
+                                                    sizeof(masked_sender)));
                         }
                         s_retry_state.is_active = false;
                     } else {
@@ -108,15 +118,18 @@ void sms_processor_task(void *pvParameters) {
 
         // Use timeout-based receive to allow processing retries and stored SMS
         if (xQueueReceive(sms_queue, &received_sms, queue_timeout) == pdPASS) {
-            ESP_LOGI(TAG, "SMS Processor received new SMS: Sender='%s', Content='%s'",
-                     received_sms.sender, received_sms.content);
+            char masked_sender[LOG_MASKED_PHONE_SIZE];
+            ESP_LOGI(TAG, "SMS Processor received new SMS: Sender='%s', content_len=%u",
+                     log_mask_phone(received_sms.sender, masked_sender, sizeof(masked_sender)),
+                     (unsigned)strlen(received_sms.content));
 
             // If there's already a retry in progress, save this new SMS to NVS
             if (s_retry_state.is_active) {
                 ESP_LOGW(TAG, "Retry in progress, saving new SMS to NVS for later processing");
                 if (sms_storage_save(&received_sms) != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to save new SMS to NVS, message from '%s' is lost",
-                             received_sms.sender);
+                             log_mask_phone(received_sms.sender, masked_sender,
+                                            sizeof(masked_sender)));
                 }
                 continue;
             }

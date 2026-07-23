@@ -1,4 +1,5 @@
 idf_component_register(SRCS "sms_storage.c" "main.c"
+                           "log_redaction.c"
                            "wifi_manager.c"
                            "uart_at_manager.c"
                            "uart_dtu_manager.c"

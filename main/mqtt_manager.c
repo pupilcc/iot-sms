@@ -16,6 +16,7 @@
 #include "mqtt_manager.h"
 #include "uart_at_manager.h" // 包含此头文件以访问全局变量 g_sim_operator 和 g_sim_phone_number
 #include "wifi_manager.h"     // 包含此头文件以检查Wi-Fi连接状态
+#include "log_redaction.h"
 
 static const char *TAG = "mqtt_manager";
 
@@ -82,9 +83,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA (topic_len=%d, data_len=%d)",
+                 event->topic_len, event->data_len);
         // Handle incoming MQTT commands if subscribed
         break;
     case MQTT_EVENT_ERROR:
@@ -109,7 +109,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (s_last_wifi_reconnect_time > 0 && time_since_reconnect_ms < 5000) {
                     ESP_LOGW(TAG, "Wi-Fi recently reconnected (%lld ms ago). Network may still be stabilizing...", time_since_reconnect_ms);
                 } else {
-                    ESP_LOGW(TAG, "Wi-Fi is connected but MQTT broker unreachable. Check broker address: %s", MQTT_BROKER_URI);
+                    ESP_LOGW(TAG, "Wi-Fi is connected but MQTT broker is unreachable. Check the configured broker address.");
                 }
             }
         }
@@ -147,7 +147,7 @@ void mqtt_manager_start(void)
     }
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_mqtt_client);
-    ESP_LOGI(TAG, "MQTT client started, connecting to %s", MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "MQTT client started, connecting to configured broker");
 }
 
 esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
@@ -194,7 +194,14 @@ esp_err_t mqtt_manager_publish_sms(const sms_message_t *sms) {
         ESP_LOGE(TAG, "Failed to publish SMS message to topic %s", MQTT_TOPIC_SMS);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Published SMS (msg_id=%d) to topic %s: %s", msg_id, MQTT_TOPIC_SMS, payload);
+    char masked_sender[LOG_MASKED_PHONE_SIZE];
+    char masked_local_number[LOG_MASKED_PHONE_SIZE];
+    ESP_LOGI(TAG,
+             "Published SMS (msg_id=%d) to topic %s: sender=%s, local_number=%s, content_len=%u",
+             msg_id, MQTT_TOPIC_SMS,
+             log_mask_phone(sms->sender, masked_sender, sizeof(masked_sender)),
+             log_mask_phone(local_number, masked_local_number, sizeof(masked_local_number)),
+             (unsigned)strlen(sms->content));
     return ESP_OK;
 }
 
@@ -266,6 +273,9 @@ esp_err_t mqtt_manager_publish_device_ready(const char *operator_name) {
         ESP_LOGE(TAG, "Failed to publish device ready message to topic %s", device_ready_topic);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Published device ready (msg_id=%d) to topic %s: %s", msg_id, device_ready_topic, payload);
+    char masked_local_number[LOG_MASKED_PHONE_SIZE];
+    ESP_LOGI(TAG, "Published device ready (msg_id=%d) to topic %s: local_number=%s",
+             msg_id, device_ready_topic,
+             log_mask_phone(local_number, masked_local_number, sizeof(masked_local_number)));
     return ESP_OK;
 }

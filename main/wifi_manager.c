@@ -13,6 +13,7 @@
 #include "esp_netif.h"
 
 #include "wifi_manager.h" // Include our own header
+#include "log_redaction.h"
 
 // Configuration from Kconfig
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_APP_WIFI_SSID
@@ -139,11 +140,11 @@ esp_err_t wifi_manager_init_sta(void)
      * happened. */
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+                 EXAMPLE_ESP_WIFI_SSID, LOG_REDACTED_VALUE);
         return ESP_OK;
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+                 EXAMPLE_ESP_WIFI_SSID, LOG_REDACTED_VALUE);
         return ESP_FAIL;
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");

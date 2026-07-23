@@ -10,6 +10,7 @@
 
 #include "uart_dtu_manager.h"
 #include "mqtt_manager.h"
+#include "log_redaction.h"
 
 // Configuration from Kconfig (与AT版共用同一组UART配置)
 #define UART_PORT_NUM      CONFIG_APP_UART_PORT_NUM
@@ -186,7 +187,8 @@ static bool parse_sms_line(const char *line, sms_message_t *sms) {
     sms->sender[sender_len] = '\0';
 
     if (decode_utf8_hex(comma + 1, sms->content, sizeof(sms->content)) < 0) {
-        ESP_LOGW(TAG, "Failed to decode SMS content hex: %.64s...", comma + 1);
+        ESP_LOGW(TAG, "Failed to decode SMS content hex (hex_len=%u)",
+                 (unsigned)strlen(comma + 1));
         return false;
     }
     return true;
@@ -243,18 +245,23 @@ static void dtu_handle_line(const char *line) {
     if (line[0] == '\0') {
         return;
     }
-    ESP_LOGD(TAG, "DTU line: %s", line);
+    ESP_LOGD(TAG, "DTU line received (len=%u)", (unsigned)strlen(line));
 
     if (parse_sms_line(line, &sms)) {
+        char masked_sender[LOG_MASKED_PHONE_SIZE];
         if (sms_is_duplicate(&sms)) {
-            ESP_LOGD(TAG, "Duplicate SMS from %s ignored", sms.sender);
+            ESP_LOGD(TAG, "Duplicate SMS from %s ignored",
+                     log_mask_phone(sms.sender, masked_sender, sizeof(masked_sender)));
             return;
         }
-        ESP_LOGI(TAG, "SMS received from %s: %s", sms.sender, sms.content);
+        ESP_LOGI(TAG, "SMS received from %s (content_len=%u)",
+                 log_mask_phone(sms.sender, masked_sender, sizeof(masked_sender)),
+                 (unsigned)strlen(sms.content));
         if (xQueueSend(s_sms_queue, &sms, pdMS_TO_TICKS(1000)) == pdPASS) {
             sms_dedup_record(&sms);
         } else {
-            ESP_LOGE(TAG, "SMS queue full, message from %s dropped", sms.sender);
+            ESP_LOGE(TAG, "SMS queue full, message from %s dropped",
+                     log_mask_phone(sms.sender, masked_sender, sizeof(masked_sender)));
         }
     }
 }
@@ -289,7 +296,7 @@ static void detect_operator_from_iccid(void) {
         return;
     }
     const char *iccid = resp + strlen("config,iccid,ok,");
-    ESP_LOGI(TAG, "ICCID: %s", iccid);
+    ESP_LOGI(TAG, "ICCID read successfully (%s)", LOG_REDACTED_VALUE);
     for (size_t i = 0; i < s_iccid_operator_map_size; i++) {
         if (strncmp(iccid, s_iccid_operator_map[i].iccid_prefix, strlen(s_iccid_operator_map[i].iccid_prefix)) == 0) {
             strncpy(g_sim_operator, s_iccid_operator_map[i].operator_name_zh, sizeof(g_sim_operator) - 1);

@@ -15,6 +15,7 @@
 
 #include "remote_log.h"
 #include "mqtt_manager.h"
+#include "log_redaction.h"
 
 #if CONFIG_APP_REMOTE_LOG_ENABLE
 
@@ -367,9 +368,7 @@ esp_err_t remote_log_early_init(void)
         snprintf(s_device_id, sizeof(s_device_id), "esp32c3-%02x%02x%02x",
                  mac[3], mac[4], mac[5]);
     }
-    strlcpy(s_phone,
-            strlen(CONFIG_APP_SIM_PHONE_NUMBER) > 0 ? CONFIG_APP_SIM_PHONE_NUMBER : "UNKNOWN",
-            sizeof(s_phone));
+    log_mask_phone(CONFIG_APP_SIM_PHONE_NUMBER, s_phone, sizeof(s_phone));
 
     s_log_rb = xRingbufferCreate(RL_RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
     if (s_log_rb == NULL) {

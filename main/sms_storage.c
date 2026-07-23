@@ -4,6 +4,7 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "sms_storage.h"
+#include "log_redaction.h"
 
 static const char *TAG = "sms_storage";
 static const char *NVS_NAMESPACE = "sms_failed";
@@ -83,7 +84,10 @@ esp_err_t sms_storage_save(const sms_message_t *sms)
     }
 
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Saved SMS to NVS (key=%s, total=%lu): Sender='%s'", key, (unsigned long)count, sms->sender);
+    char masked_sender[LOG_MASKED_PHONE_SIZE];
+    ESP_LOGI(TAG, "Saved SMS to NVS (key=%s, total=%lu): Sender='%s'", key,
+             (unsigned long)count,
+             log_mask_phone(sms->sender, masked_sender, sizeof(masked_sender)));
     return ESP_OK;
 }
 
@@ -134,7 +138,9 @@ esp_err_t sms_storage_get_next(sms_message_t *sms)
     }
 
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Retrieved SMS from NVS (key=%s): Sender='%s'", key, sms->sender);
+    char masked_sender[LOG_MASKED_PHONE_SIZE];
+    ESP_LOGI(TAG, "Retrieved SMS from NVS (key=%s): Sender='%s'", key,
+             log_mask_phone(sms->sender, masked_sender, sizeof(masked_sender)));
     return ESP_OK;
 }
 
