@@ -30,9 +30,9 @@ void app_main(void)
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
     // Set log levels for debugging (optional)
-    esp_log_level_set("*", ESP_LOG_DEBUG);
+    esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set("wifi_manager", ESP_LOG_INFO);
-    esp_log_level_set("uart_at_manager", ESP_LOG_DEBUG); // Set to VERBOSE for detailed AT command logs
+    esp_log_level_set("uart_at_manager", ESP_LOG_INFO); // Set to VERBOSE for detailed AT command logs
     esp_log_level_set("uart_dtu_manager", ESP_LOG_DEBUG);
     esp_log_level_set("mqtt_manager", ESP_LOG_INFO);
     esp_log_level_set("sms_processor", ESP_LOG_INFO);
