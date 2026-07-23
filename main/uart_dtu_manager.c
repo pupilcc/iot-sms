@@ -359,8 +359,8 @@ void uart_dtu_task(void *pvParameters) {
 
     detect_operator_from_iccid();
 
-    // 开启短信功能: 开启/不过滤/不限号码/默认上报格式/通道1/开启缓存 (银尔达手册示例值)
-    if (dtu_query("config,set,smson,1,0,0,0,0,1,1", "config,smson,", resp, sizeof(resp))) {
+    // smson参数: 开启=1, 过滤=0, 允许号码=0, 上报格式=1(固定), 格式参数=0, 通道=1, 缓存=1
+    if (dtu_query("config,set,smson,1,0,0,1,0,1,1", "config,smson,", resp, sizeof(resp))) {
         ESP_LOGI(TAG, "SMS function enabled: %s", resp);
     } else {
         ESP_LOGE(TAG, "Failed to enable DTU SMS function");
