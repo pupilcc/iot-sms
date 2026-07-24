@@ -8,7 +8,7 @@ ESP-IDF firmware for ESP32-C3 that receives SMS messages via a 4G Cat.1 modem (U
 
 **Target hardware**: ESP32-C3
 **ESP-IDF version**: 5.3.1
-**Modem**: 4G Cat.1 module with AT command interface (tested with Air724UG)
+**Modem**: 4G Cat.1 module with AT command interface (tested with Air724UG and Air780EPV — the AT path must keep working on both)
 
 ## Build and Development Commands
 
@@ -47,7 +47,8 @@ There are no unit tests or linting tools configured for this project.
 
 - **main.c** — Entry point. Initializes NVS, Wi-Fi, SMS queue, spawns tasks, starts MQTT, syncs time via SNTP. Wi-Fi failure halts the application.
 - **wifi_manager** — Blocking Wi-Fi STA connection with retry.
-- **uart_at_manager** — UART communication with modem. Sends AT commands synchronously with timeout. Handles `+CMT` URCs for incoming SMS. Parses both GSM 7-bit and UCS2 (UTF-16BE→UTF-8) encoding. Detects SIM operator via IMSI lookup (`s_operator_map`). Runs two internal tasks: `uart_event_task` (UART data collection) and `uart_at_task` (AT command/URC processing).
+- **uart_at_manager** — UART communication with modem. Sends AT commands synchronously with timeout. Configures the modem for **PDU mode** (`AT+CMGF=0`) and handles `+CMT` URCs for incoming SMS, decoding each PDU locally via sms_pdu. Reassembles concatenated SMS using the UDH reference/sequence numbers (`s_concat`, out-of-order tolerant, 30s timeout flush). Detects SIM operator via IMSI lookup (`s_operator_map`). Runs two internal tasks: `uart_event_task` (UART data collection) and `uart_at_task` (AT command/URC processing).
+- **sms_pdu** — Self-contained SMS-DELIVER PDU decoder (`sms_pdu_decode()`), no FreeRTOS/UART dependencies. Handles the SMSC/TP-OA fields (numeric and GSM-7 packed alphanumeric addresses), TP-DCS alphabet selection (GSM-7 with escape table, 8-bit, UCS2 with surrogate pairs), and UDH concatenation IEs (8-bit `0x00` and 16-bit `0x08` reference). Decoding SMS locally instead of relying on the modem's text-mode conversion is deliberate — some modem firmware (e.g. Air780EPV) unpacks GSM-7 with the wrong bit alignment and produces garbled text.
 - **uart_dtu_manager** — Alternative to uart_at_manager for modems running Yinerda (银尔达) DTU transparent firmware. Selected via `APP_MODEM_FIRMWARE` Kconfig choice. Enables SMS with `config,set,smson,1,0,0,0,0,1,1`, parses `config,sms,ok,<number>,<UTF-8 hex>` lines (unsolicited reports and `config,get,sms` polling every 10s), detects operator via ICCID prefix (`s_iccid_operator_map`), dedupes repeated deliveries (report + cache polling) by sender+content fingerprint within a 10-min window. Single task: `uart_dtu_task`.
 - **mqtt_manager** — MQTT client. `mqtt_manager_publish_sms()` publishes SMS as JSON. `mqtt_manager_publish_device_ready()` sends a ready message with operator info to `esp32/device` topic.
 - **sms_processor** — Reads from SMS queue, publishes via MQTT. Non-blocking retry mechanism (3 attempts, 10s interval). On exhausted retries, persists to NVS via sms_storage. On startup, retries any SMS stored from previous sessions.
@@ -106,3 +107,9 @@ Edit `mqtt_manager_publish_sms()` in `mqtt_manager.c`. Current format: JSON with
 ```c
 esp_log_level_set("uart_at_manager", ESP_LOG_VERBOSE);
 ```
+
+This also enables the `Raw PDU: <hex>` line logged for every incoming SMS, which can be
+replayed through `sms_pdu_decode()` on a host to debug decoding. Note that DEBUG logs are
+stripped at compile time unless `CONFIG_LOG_MAXIMUM_LEVEL` is raised to 4, and that
+remote_log forwards INFO and above to MQTT — keep the raw PDU at DEBUG so SMS content is
+not published.
