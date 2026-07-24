@@ -48,7 +48,14 @@ char g_sim_operator[32] = {0};
 // SMS分段拼接相关结构和常量
 #define SMS_FRAGMENT_TIMEOUT_MS 30000  // 30秒超时,认为分段SMS已完成
 #define MAX_SMS_FRAGMENTS 10           // 最大支持10段SMS拼接
-#define SMS_FRAGMENT_THRESHOLD 500     // hex字符串超过500认为可能是分段SMS
+
+// 文本模式 + AT+CSCS="UCS2" 下每个字符固定占4个hex字符。
+// 长短信的"非末尾"分段载荷长度由协议固定,单条短信最多160(GSM-7)/70(UCS2)字符,
+// 因此只有长度精确落在下列值上才可能是中间分段。
+#define SMS_PART_HEX_LEN_GSM7_8BIT_REF  612  // 153字符 (6字节UDH)
+#define SMS_PART_HEX_LEN_GSM7_16BIT_REF 608  // 152字符 (7字节UDH)
+#define SMS_PART_HEX_LEN_UCS2_8BIT_REF  268  // 67字符  (6字节UDH)
+#define SMS_PART_HEX_LEN_UCS2_16BIT_REF 264  // 66字符  (7字节UDH)
 
 typedef struct {
     char sender[32];              // 发件人号码
@@ -71,8 +78,10 @@ static esp_err_t parse_cmt_text_mode_response(const char *response, sms_message_
 static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, size_t utf8_buf_len);
 
 // SMS分段拼接相关函数声明
+static bool is_multipart_part_hex_len(int hex_len);
 static bool is_fragment_timeout(void);
 static void reset_fragment_buffer(void);
+static void flush_fragment_buffer_to_queue(const char *reason);
 static esp_err_t process_sms_fragment(const char *sender, const char *content_hex, int content_hex_len, sms_message_t *complete_sms);
 
 // 新增的获取SIM卡信息的辅助函数
@@ -776,15 +785,21 @@ void uart_at_task(void *pvParameters) {
 
     // Main loop to listen for incoming URCs (like +CMT:)
     while (1) {
-        // Wait for a URC to be signaled by the uart_event_task
+        // Wait for a URC to be signaled by the uart_event_task. The finite
+        // timeout also drives the fragment buffer timeout check below.
         EventBits_t uxBits = xEventGroupWaitBits(s_at_response_event_group,
                                                  AT_RESPONSE_URC_BIT,
                                                  pdTRUE, // Clear bit on exit
                                                  pdFALSE, // Don't wait for all bits
-                                                 portMAX_DELAY); // Wait indefinitely
+                                                 pdMS_TO_TICKS(1000));
 
         if (uxBits & AT_RESPONSE_URC_BIT) {
             process_pending_sms_urcs();
+        }
+
+        // 最后一段迟迟不到时的兜底:投递已累积的内容,绝不静默丢弃
+        if (is_fragment_timeout()) {
+            flush_fragment_buffer_to_queue("fragment timeout");
         }
     }
 }
@@ -896,6 +911,17 @@ static void decode_ucs2_hex_to_utf8(const char *ucs2_hex_str, char *utf8_buf, si
 // ==================== SMS分段拼接相关函数实现 ====================
 
 /**
+ * @brief 判断这段内容的长度是否等于长短信"非末尾"分段的固定载荷长度
+ * @return true 如果可能是中间分段, false 如果是完整的单条短信或最后一段
+ */
+static bool is_multipart_part_hex_len(int hex_len) {
+    return hex_len == SMS_PART_HEX_LEN_GSM7_8BIT_REF ||
+           hex_len == SMS_PART_HEX_LEN_GSM7_16BIT_REF ||
+           hex_len == SMS_PART_HEX_LEN_UCS2_8BIT_REF ||
+           hex_len == SMS_PART_HEX_LEN_UCS2_16BIT_REF;
+}
+
+/**
  * @brief 检查分段缓冲区是否超时
  * @return true if timeout, false otherwise
  */
@@ -910,7 +936,7 @@ static bool is_fragment_timeout(void) {
     // 转换为毫秒并检查是否超时
     if ((elapsed * portTICK_PERIOD_MS) > SMS_FRAGMENT_TIMEOUT_MS) {
         char masked_sender[LOG_MASKED_PHONE_SIZE];
-        ESP_LOGW(TAG, "SMS fragment buffer timeout after %d ms, discarding %d fragments from sender '%s'",
+        ESP_LOGW(TAG, "SMS fragment buffer timeout after %d ms, flushing %d fragments from sender '%s'",
                  (int)(elapsed * portTICK_PERIOD_MS), s_fragment_buffer.fragment_count,
                  log_mask_phone(s_fragment_buffer.sender, masked_sender,
                                 sizeof(masked_sender)));
@@ -926,6 +952,39 @@ static void reset_fragment_buffer(void) {
     memset(&s_fragment_buffer, 0, sizeof(s_fragment_buffer));
     s_fragment_buffer.is_active = false;
     ESP_LOGD(TAG, "SMS fragment buffer reset");
+}
+
+/**
+ * @brief 把缓冲区中已累积的内容组装成消息并投递到SMS队列,然后重置缓冲区
+ *
+ * 用于最后一段始终未到达的情况:宁可投递可能不完整的内容,也不静默丢弃。
+ *
+ * @param reason 冲刷原因,仅用于日志
+ */
+static void flush_fragment_buffer_to_queue(const char *reason) {
+    // 分段逻辑只在uart_at_task单线程内执行,static避免在深调用链上再压2KB栈
+    static sms_message_t flushed_sms;
+
+    if (!s_fragment_buffer.is_active) {
+        return;
+    }
+
+    memset(&flushed_sms, 0, sizeof(flushed_sms));
+    strncpy(flushed_sms.sender, s_fragment_buffer.sender, sizeof(flushed_sms.sender) - 1);
+    decode_ucs2_hex_to_utf8(s_fragment_buffer.accumulated_content, flushed_sms.content,
+                            sizeof(flushed_sms.content));
+    int fragment_count = s_fragment_buffer.fragment_count;
+
+    reset_fragment_buffer();
+
+    if (s_sms_queue != NULL) {
+        if (xQueueSend(s_sms_queue, &flushed_sms, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to send flushed SMS to queue (%s).", reason);
+        } else {
+            ESP_LOGI(TAG, "Flushed %d pending SMS fragment(s) to processing queue (%s).",
+                     fragment_count, reason);
+        }
+    }
 }
 
 /**
@@ -946,20 +1005,20 @@ static esp_err_t process_sms_fragment(const char *sender, const char *content_he
     char masked_sender[LOG_MASKED_PHONE_SIZE];
     log_mask_phone(sender, masked_sender, sizeof(masked_sender));
 
-    // 检查是否超时,如果超时则重置缓冲区
+    // 检查是否超时,如果超时则先投递已累积的内容
     if (is_fragment_timeout()) {
-        reset_fragment_buffer();
+        flush_fragment_buffer_to_queue("fragment timeout");
     }
 
-    // 判断这是否是一个可能的分段SMS (内容较长)
-    bool is_likely_fragment = (content_hex_len >= SMS_FRAGMENT_THRESHOLD);
+    // 判断这是否是长短信的中间分段 (长度精确等于协议规定的分段载荷长度)
+    bool is_multipart_part = is_multipart_part_hex_len(content_hex_len);
 
-    ESP_LOGD(TAG, "process_sms_fragment: sender='%s', len=%d, is_likely_fragment=%d, buffer_active=%d",
-             masked_sender, content_hex_len, is_likely_fragment, s_fragment_buffer.is_active);
+    ESP_LOGD(TAG, "process_sms_fragment: sender='%s', len=%d, is_multipart_part=%d, buffer_active=%d",
+             masked_sender, content_hex_len, is_multipart_part, s_fragment_buffer.is_active);
 
     // 场景1: 如果缓冲区是空的
     if (!s_fragment_buffer.is_active) {
-        if (is_likely_fragment) {
+        if (is_multipart_part) {
             // 这可能是第一个分段,开始累积
             ESP_LOGI(TAG, "Starting SMS fragment accumulation from sender '%s' (fragment 1, len=%d)",
                      masked_sender, content_hex_len);
@@ -996,10 +1055,10 @@ static esp_err_t process_sms_fragment(const char *sender, const char *content_he
                          s_fragment_buffer.fragment_count, masked_sender,
                          (int)strlen(s_fragment_buffer.accumulated_content));
 
-                // 判断是否是最后一个分段 (较短的片段通常是最后一段)
-                if (!is_likely_fragment) {
+                // 判断是否是最后一个分段 (长度不等于分段载荷长度的就是最后一段)
+                if (!is_multipart_part) {
                     // 这个片段较短,可能是最后一段
-                    ESP_LOGI(TAG, "Detected final SMS fragment (len=%d < threshold), completing message with %d fragments",
+                    ESP_LOGI(TAG, "Detected final SMS fragment (len=%d), completing message with %d fragments",
                              content_hex_len, s_fragment_buffer.fragment_count);
 
                     // 组装完整消息
@@ -1033,14 +1092,10 @@ static esp_err_t process_sms_fragment(const char *sender, const char *content_he
                      log_mask_phone(s_fragment_buffer.sender, masked_previous_sender,
                                     sizeof(masked_previous_sender)));
 
-            // 先用旧的片段组装消息
-            strncpy(complete_sms->sender, s_fragment_buffer.sender, sizeof(complete_sms->sender) - 1);
-            decode_ucs2_hex_to_utf8(s_fragment_buffer.accumulated_content, complete_sms->content, sizeof(complete_sms->content));
+            // 旧片段直接投递到队列,不能借用complete_sms(会被下面的递归覆盖)
+            flush_fragment_buffer_to_queue("sender changed");
 
-            // 重置并开始新的片段累积(如果需要)
-            reset_fragment_buffer();
-
-            // 递归处理新的SMS
+            // 缓冲区已清空,递归只会走场景1,深度确定为1
             return process_sms_fragment(sender, content_hex, content_hex_len, complete_sms);
         }
     }
