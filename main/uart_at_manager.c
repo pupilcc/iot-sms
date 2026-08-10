@@ -65,14 +65,34 @@ static sms_concat_buffer_t s_concat = {0};
 // PDU模式下+CMT正文是单行hex,长度上界由TPDU大小决定,远小于文本模式
 #define SMS_PDU_HEX_MAX 512
 
+// 直投短信的确认要挡在收信路径上,超时时间取得比普通命令短
+#define AT_CNMA_TIMEOUT_MS 3000
+// +CMTI待读取索引的暂存深度,以及启动时清空模组存储的最大轮数
+#define SMS_PENDING_READ_MAX 8
+#define SMS_DRAIN_MAX_ROUNDS 10
+
+// URC解析在持有s_uart_rx_mutex的上下文里跑,不能就地发AT命令(at_send_command会
+// 重入同一把非递归互斥锁)。这里只记下待办,回到uart_at_task主循环再执行。
+static bool s_cmt_ack_pending = false;
+static int  s_pending_read_index[SMS_PENDING_READ_MAX];
+static int  s_pending_read_count = 0;
+
+// 模组是否要求TE确认直投短信。仅在回读确认模组处于phase 1时才关掉:漏发确认会让
+// 网络停投,代价远大于多发一条,所以拿不准时一律发。
+static bool s_cnma_required = true;
+
 // Forward declarations
 static int handle_urc(char *urc_line_buffer);
+static bool has_complete_sms_urc_locked(void);
 static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t buffer_size, TickType_t timeout_ticks);
 static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_size,
                                          bool *modem_responding);
 static void process_pending_sms_urcs(void);
 static void wait_for_recovery_retry(TickType_t delay_ticks);
-static esp_err_t parse_cmt_pdu_response(const char *response, sms_message_t *sms_msg);
+static esp_err_t extract_and_dispatch_pdu(const char *response, const char *header);
+static void ack_direct_sms_if_pending(void);
+static void read_pending_stored_sms(void);
+static void drain_stored_sms(void);
 
 // 长短信重组相关函数声明
 static bool is_concat_timeout(void);
@@ -174,7 +194,10 @@ static void uart_event_task(void *pvParameters) {
                             // 检查是否是需要忽略的URC (不是+CMT的其他URC)
                             if (*buffer_ptr == '+' || *buffer_ptr == '^') {
                                 // +CME ERROR/+CMS ERROR是AT命令的终止响应，不是普通URC
+                                // +CMTI是模组把短信存进存储后的通知,必须保留:丢掉它
+                                // 等于丢掉整条短信,而且存储会一直涨到写满
                                 bool should_preserve_line = strncmp(buffer_ptr, "+CMT:", 5) == 0 ||
+                                                            strncmp(buffer_ptr, "+CMTI:", 6) == 0 ||
                                                             strncmp(buffer_ptr, "+CME ERROR:", 11) == 0 ||
                                                             strncmp(buffer_ptr, "+CMS ERROR:", 11) == 0;
                                 if (should_preserve_line) {
@@ -223,19 +246,9 @@ static void uart_event_task(void *pvParameters) {
                             xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_ERROR_BIT);
                         }
 
-                        // Check for +CMT URC
-                        char *cmt_pos = strstr(s_uart_rx_buffer, "+CMT:");
-                        if (cmt_pos) {
-                            // Look for the end of the +CMT URC block: two \r\n sequences after +CMT: header
-                            // +CMT: "sender",,"timestamp"\r\n<content>\r\n
-                            char *first_crlf = strstr(cmt_pos, "\r\n");
-                            if (first_crlf) {
-                                char *second_crlf = strstr(first_crlf + 2, "\r\n"); // Look for second \r\n after the first
-                                if (second_crlf) {
-                                    // Found a complete +CMT URC block
-                                    xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_URC_BIT);
-                                }
-                            }
+                        // Check for a complete incoming-SMS URC (+CMT block or +CMTI line)
+                        if (has_complete_sms_urc_locked()) {
+                            xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_URC_BIT);
                         }
                     }
                     xSemaphoreGive(s_uart_rx_mutex);
@@ -270,14 +283,26 @@ static void uart_event_task(void *pvParameters) {
 }
 
 
-static bool has_complete_sms_urc_locked(void) {
-    char *cmt_pos = strstr(s_uart_rx_buffer, "+CMT:");
-    if (cmt_pos == NULL) {
+// +CMT占两行(头行 + PDU行), +CMTI只有一行
+static bool is_complete_urc_at(const char *pos, bool two_lines) {
+    const char *first_crlf = strstr(pos, "\r\n");
+    if (first_crlf == NULL) {
         return false;
     }
+    if (!two_lines) {
+        return true;
+    }
+    return strstr(first_crlf + 2, "\r\n") != NULL;
+}
 
-    char *first_crlf = strstr(cmt_pos, "\r\n");
-    return first_crlf != NULL && strstr(first_crlf + 2, "\r\n") != NULL;
+static bool has_complete_sms_urc_locked(void) {
+    const char *cmt_pos = strstr(s_uart_rx_buffer, "+CMT:");
+    if (cmt_pos != NULL && is_complete_urc_at(cmt_pos, true)) {
+        return true;
+    }
+
+    const char *cmti_pos = strstr(s_uart_rx_buffer, "+CMTI:");
+    return cmti_pos != NULL && is_complete_urc_at(cmti_pos, false);
 }
 
 static void process_pending_sms_urcs_locked(void) {
@@ -308,7 +333,13 @@ static void process_pending_sms_urcs(void) {
 }
 
 static void clear_command_data_preserving_sms_locked(void) {
+    // 两种收信URC都可能只到达了一半,取靠前的那个作为保留起点
     char *cmt_start = strstr(s_uart_rx_buffer, "+CMT:");
+    char *cmti_start = strstr(s_uart_rx_buffer, "+CMTI:");
+
+    if (cmt_start == NULL || (cmti_start != NULL && cmti_start < cmt_start)) {
+        cmt_start = cmti_start;
+    }
 
     if (cmt_start != NULL) {
         int preserved_len = s_uart_rx_buffer_idx - (int)(cmt_start - s_uart_rx_buffer);
@@ -379,47 +410,64 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
     clear_command_data_preserving_sms_locked();
     xSemaphoreGive(s_uart_rx_mutex);
 
+    // 命令字符串本身不含敏感数据(敏感内容只出现在响应里),带上它才能定位是哪条超时
     if (uxBits & AT_RESPONSE_OK_BIT) {
-        ESP_LOGD(TAG, "AT command succeeded (response_len=%u)",
-                 (unsigned)strlen(response_buffer));
+        ESP_LOGD(TAG, "'%s' succeeded (response_len=%u)",
+                 cmd, (unsigned)strlen(response_buffer));
         return ESP_OK;
     } else if (uxBits & AT_RESPONSE_ERROR_BIT) {
-        ESP_LOGW(TAG, "AT command failed (response_len=%u)",
-                 (unsigned)strlen(response_buffer));
+        ESP_LOGW(TAG, "'%s' failed (response_len=%u)",
+                 cmd, (unsigned)strlen(response_buffer));
         return ESP_FAIL;
     } else {
         if (response_buffer[0] != '\0') {
-            ESP_LOGE(TAG, "AT command timed out (partial_response_len=%u)",
-                     (unsigned)strlen(response_buffer));
+            ESP_LOGE(TAG, "'%s' timed out (partial_response_len=%u)",
+                     cmd, (unsigned)strlen(response_buffer));
         } else {
-            ESP_LOGE(TAG, "AT command timed out (no response received)");
+            ESP_LOGE(TAG, "'%s' timed out (no response received)", cmd);
         }
         return ESP_FAIL;
     }
 }
 
 /**
- * @brief Parses a +CMT URC (PDU Mode) and feeds the decoded part to the concat buffer.
- * Example: +CMT: ,23\r\n0791683108200105F0040D91...\r\n
- *
- * 头行的<alpha>/<length>不使用:发件人与正文都从PDU自身解出,不依赖模组的文本模式转换。
- *
- * @param response The full AT response string.
- * @param sms_msg Pointer to sms_message_t to fill.
- * @return ESP_OK on success (complete SMS ready),
- *         ESP_ERR_INVALID_STATE if waiting for more parts,
- *         ESP_FAIL if parsing fails.
+ * @brief 把一条完整的SMS投递到处理队列
  */
-static esp_err_t parse_cmt_pdu_response(const char *response, sms_message_t *sms_msg) {
+static void queue_complete_sms(sms_message_t *sms) {
+    if (s_sms_queue == NULL) {
+        return;
+    }
+    if (xQueueSend(s_sms_queue, sms, portMAX_DELAY) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to send complete SMS to queue.");
+    } else {
+        ESP_LOGI(TAG, "Complete SMS sent to processing queue.");
+    }
+}
+
+/**
+ * @brief 从<header>所在行的下一行取出PDU,解码、重组,集齐后直接投递到队列。
+ *
+ * 三种来源共用:直投的 +CMT: ,23\r\n0791...、读取存储的 +CMGR: 1,,23\r\n0791...、
+ * 以及列举存储的 +CMGL: 1,1,,23\r\n0791...。头行的<alpha>/<length>一律不使用,
+ * 发件人与正文都从PDU自身解出,不依赖模组的文本模式转换。
+ *
+ * @param response 含有该头行的响应文本
+ * @param header   头行前缀,如"+CMT:"
+ * @return ESP_OK 完整SMS已投递,
+ *         ESP_ERR_INVALID_STATE 这是一个分段,已存储待续,
+ *         ESP_FAIL 解析或解码失败
+ */
+static esp_err_t extract_and_dispatch_pdu(const char *response, const char *header) {
     // 均只在uart_at_task单线程内使用,static避免在深调用链上压栈
     static char s_pdu_hex[SMS_PDU_HEX_MAX];
     static sms_pdu_t s_part;
+    static sms_message_t s_sms;
 
-    if (!response || !sms_msg) return ESP_FAIL;
+    if (!response || !header) return ESP_FAIL;
 
-    const char *line = strstr(response, "+CMT:");
+    const char *line = strstr(response, header);
     if (!line) {
-        ESP_LOGW(TAG, "CMT prefix not found in response.");
+        ESP_LOGW(TAG, "%s prefix not found in response.", header);
         return ESP_FAIL;
     }
 
@@ -468,11 +516,12 @@ static esp_err_t parse_cmt_pdu_response(const char *response, sms_message_t *sms
                  masked_sender, (unsigned)strlen(s_part.text));
     }
 
-    esp_err_t result = process_sms_part(&s_part, sms_msg);
+    esp_err_t result = process_sms_part(&s_part, &s_sms);
     if (result == ESP_OK) {
         ESP_LOGI(TAG, "Complete SMS assembled: Sender='%s', content_len=%u",
-                 log_mask_phone(sms_msg->sender, masked_sender, sizeof(masked_sender)),
-                 (unsigned)strlen(sms_msg->content));
+                 log_mask_phone(s_sms.sender, masked_sender, sizeof(masked_sender)),
+                 (unsigned)strlen(s_sms.content));
+        queue_complete_sms(&s_sms);
     } else if (result == ESP_ERR_INVALID_STATE) {
         ESP_LOGI(TAG, "SMS part stored, waiting for more parts...");
     } else {
@@ -673,6 +722,35 @@ static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_si
     }
     vTaskDelay(pdMS_TO_TICKS(500));
 
+    // 27.005规定phase 2+下直投的短信必须由TE用AT+CNMA确认。声明phase 1让模组自己
+    // 向网络回RP-ACK,省掉这个往返。
+    s_cnma_required = true;
+    if (at_send_command("AT+CSMS=0", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to select SMS phase 1 (AT+CSMS=0). Relying on AT+CNMA instead.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 回读实际生效的phase。AT+CSMS=0的响应只报告支持能力(+CSMS: <mt>,<mo>,<bm>),
+    // 当前service要用查询形式才拿得到(+CSMS: <service>,<mt>,<mo>,<bm>)。
+    // phase 1下CNMA不适用,而部分固件(Air724UG)对不适用的命令是静默不响应,
+    // 照发会让每条短信白等一次超时。
+    if (at_send_command("AT+CSMS?", response_buffer, buffer_size,
+                        pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) == ESP_OK) {
+        const char *csms = strstr(response_buffer, "+CSMS:");
+        int service = -1;
+        if (csms != NULL && sscanf(csms, "+CSMS: %d", &service) == 1) {
+            s_cnma_required = (service != 0);
+            ESP_LOGI(TAG, "Modem SMS service phase: %d (direct SMS ack %s)",
+                     service, s_cnma_required ? "required" : "not needed");
+        } else {
+            ESP_LOGW(TAG, "Could not parse AT+CSMS? response; will acknowledge direct SMS.");
+        }
+    } else {
+        ESP_LOGW(TAG, "AT+CSMS? failed; will acknowledge direct SMS.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     if (at_send_command("AT+CNMI=2,2,0,0,0", response_buffer, buffer_size,
                         pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure new SMS indications (AT+CNMI).");
@@ -689,6 +767,138 @@ static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_si
     return ESP_OK;
 }
 
+
+/**
+ * @brief 确认上一条直投短信
+ *
+ * 27.005: <mt>=2 直投给TE的短信若得不到确认,模组会向网络回RP-ERROR,并把<mt>和<ds>
+ * 自动复位为0——此后所有短信都不再送到串口,而是被SMSC扣住重投,表现为"整段时间一条
+ * 都收不到,把SIM插回手机才一次性全到"。
+ *
+ * 只在phase 2+下才发:phase 1的模组要么回+CMS ERROR: 340,要么(如Air724UG)干脆不响应,
+ * 后者会让每条短信都白等一次AT_CNMA_TIMEOUT_MS。
+ */
+static void ack_direct_sms_if_pending(void) {
+    static char ack_response[128];
+
+    if (!s_cmt_ack_pending) {
+        return;
+    }
+    s_cmt_ack_pending = false;
+
+    if (!s_cnma_required) {
+        return; // phase 1: 模组已自行向网络回RP-ACK
+    }
+
+    if (at_send_command("AT+CNMA=0", ack_response, sizeof(ack_response),
+                        pdMS_TO_TICKS(AT_CNMA_TIMEOUT_MS)) != ESP_OK) {
+        ESP_LOGD(TAG, "AT+CNMA=0 rejected (no acknowledgement expected, harmless)");
+    } else {
+        ESP_LOGD(TAG, "Direct SMS acknowledged to the network");
+    }
+}
+
+/**
+ * @brief 读取+CMTI通知过的存储短信,读完即删
+ *
+ * 删除不是可选项:存储写满后模组会告诉网络"内存已满",SMSC随即停止投递所有短信。
+ */
+static void read_pending_stored_sms(void) {
+    static char response[AT_RESPONSE_MAX_LEN];
+    char cmd[32];
+
+    while (s_pending_read_count > 0) {
+        // 读取存储期间也可能来直投短信,别让确认排在整批读完之后
+        ack_direct_sms_if_pending();
+
+        int index = s_pending_read_index[0];
+        for (int i = 1; i < s_pending_read_count; i++) {
+            s_pending_read_index[i - 1] = s_pending_read_index[i];
+        }
+        s_pending_read_count--;
+
+        snprintf(cmd, sizeof(cmd), "AT+CMGR=%d", index);
+        if (at_send_command(cmd, response, sizeof(response),
+                            pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read stored SMS at index %d", index);
+            continue;
+        }
+
+        // 解码失败也要删:否则这一格永远占着,最终把存储堵满
+        if (extract_and_dispatch_pdu(response, "+CMGR:") == ESP_FAIL) {
+            ESP_LOGW(TAG, "Failed to decode stored SMS at index %d, deleting it anyway", index);
+        }
+
+        snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", index);
+        if (at_send_command(cmd, response, sizeof(response),
+                            pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to delete stored SMS at index %d", index);
+        }
+    }
+}
+
+/**
+ * @brief 启动时取出并清空模组存储里积压的短信
+ *
+ * 存储被写满后SMSC会停投,清空是让网络恢复投递的前提。响应可能超过
+ * AT_RESPONSE_MAX_LEN被截断,所以分多轮列举:每轮处理完就删除,下一轮重新列举。
+ */
+static void drain_stored_sms(void) {
+    static char response[AT_RESPONSE_MAX_LEN];
+    int indices[SMS_PENDING_READ_MAX];
+    char cmd[32];
+    int drained = 0;
+
+    for (int round = 0; round < SMS_DRAIN_MAX_ROUNDS; round++) {
+        // 清空存储可能耗时不短,期间到达的直投短信要及时确认
+        ack_direct_sms_if_pending();
+
+        // PDU模式下<stat>=4表示列出全部状态的短信
+        if (at_send_command("AT+CMGL=4", response, sizeof(response),
+                            pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+            ESP_LOGW(TAG, "AT+CMGL=4 failed, skipping stored SMS drain.");
+            return;
+        }
+
+        int count = 0;
+        const char *p = response;
+        while (count < SMS_PENDING_READ_MAX && (p = strstr(p, "+CMGL:")) != NULL) {
+            // 头行和PDU行都到齐才算一条完整条目,残缺的留给下一轮
+            const char *first_crlf = strstr(p, "\r\n");
+            if (first_crlf == NULL) break;
+            const char *second_crlf = strstr(first_crlf + 2, "\r\n");
+            if (second_crlf == NULL) break;
+
+            int index = -1;
+            if (sscanf(p, "+CMGL: %d", &index) != 1) break;
+
+            extract_and_dispatch_pdu(p, "+CMGL:");
+            indices[count++] = index;
+            p = second_crlf + 2;
+        }
+
+        if (count == 0) {
+            if (drained > 0) {
+                ESP_LOGI(TAG, "Drained %d stored SMS from modem storage", drained);
+            } else {
+                ESP_LOGI(TAG, "No stored SMS in modem storage");
+            }
+            return;
+        }
+
+        for (int i = 0; i < count; i++) {
+            snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", indices[i]);
+            if (at_send_command(cmd, response, sizeof(response),
+                                pdMS_TO_TICKS(AT_COMMAND_TIMEOUT_MS)) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to delete stored SMS at index %d", indices[i]);
+            }
+        }
+        drained += count;
+    }
+
+    ESP_LOGW(TAG, "Stored SMS drain stopped after %d rounds (%d drained)",
+             SMS_DRAIN_MAX_ROUNDS, drained);
+}
 
 void uart_at_task(void *pvParameters) {
     char response_buffer[AT_RESPONSE_MAX_LEN];
@@ -743,6 +953,9 @@ void uart_at_task(void *pvParameters) {
     process_pending_sms_urcs();
     ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
 
+    // 取走上次运行期间被存进模组、从未投递出去的短信,并腾空存储
+    drain_stored_sms();
+
     ESP_LOGI(TAG, "Publishing device ready message to MQTT...");
     if (mqtt_manager_publish_device_ready(g_sim_operator) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to publish device ready message.");
@@ -762,6 +975,10 @@ void uart_at_task(void *pvParameters) {
             process_pending_sms_urcs();
         }
 
+        // 网络等待RP-ACK的时间只有几秒,确认必须紧跟在URC处理之后
+        ack_direct_sms_if_pending();
+        read_pending_stored_sms();
+
         // 剩余分段迟迟不到时的兜底:投递已累积的内容,绝不静默丢弃
         if (is_concat_timeout()) {
             flush_concat_buffer_to_queue("part timeout");
@@ -769,50 +986,89 @@ void uart_at_task(void *pvParameters) {
     }
 }
 
+/**
+ * @brief 记下一条待读取的存储短信索引,回到主循环再发AT+CMGR
+ */
+static void push_pending_read(int index) {
+    if (s_pending_read_count >= SMS_PENDING_READ_MAX) {
+        ESP_LOGW(TAG, "Pending stored-SMS list is full, dropping index %d", index);
+        return;
+    }
+    s_pending_read_index[s_pending_read_count++] = index;
+}
+
+/**
+ * @brief 处理直投短信URC: +CMT: ,23\r\n0791...\r\n
+ * @return 从缓冲区起始算起已消费的字节数,URC不完整时返回0
+ */
+static int handle_cmt_urc(char *urc_line_buffer, char *cmt_ptr) {
+    char *first_crlf = strstr(cmt_ptr, "\r\n");
+    if (!first_crlf) {
+        return 0;
+    }
+    char *second_crlf = strstr(first_crlf + 2, "\r\n");
+    if (!second_crlf) {
+        return 0;
+    }
+
+    int urc_len = (second_crlf - cmt_ptr) + 2; // 从+CMT开头到第二个\r\n结束
+
+    // Temporarily null-terminate the URC block for parsing
+    char temp_char = cmt_ptr[urc_len];
+    cmt_ptr[urc_len] = '\0';
+
+    ESP_LOGI(TAG, "New SMS received (direct URC).");
+    if (extract_and_dispatch_pdu(cmt_ptr, "+CMT:") == ESP_FAIL) {
+        ESP_LOGW(TAG, "Failed to parse SMS URC.");
+    }
+    // 无论解码成败都要确认:未确认的直投短信会被模组回RP-ERROR退给网络
+    s_cmt_ack_pending = true;
+
+    cmt_ptr[urc_len] = temp_char; // Restore original char
+    return (cmt_ptr - urc_line_buffer) + urc_len;
+}
+
+/**
+ * @brief 处理存储通知URC: +CMTI: "SM",3
+ * @return 从缓冲区起始算起已消费的字节数,URC不完整时返回0
+ */
+static int handle_cmti_urc(char *urc_line_buffer, char *cmti_ptr) {
+    char *crlf = strstr(cmti_ptr, "\r\n");
+    if (!crlf) {
+        return 0;
+    }
+
+    int urc_len = (crlf - cmti_ptr) + 2;
+    char temp_char = cmti_ptr[urc_len];
+    cmti_ptr[urc_len] = '\0';
+
+    char mem[8] = {0};
+    int index = -1;
+    if (sscanf(cmti_ptr, "+CMTI: \"%7[^\"]\",%d", mem, &index) == 2 ||
+        sscanf(cmti_ptr, "+CMTI: %7[^,],%d", mem, &index) == 2) {
+        // <mem>只做记录:CMGR/CMGD走当前选中的存储,两者不一致时能从日志看出来
+        ESP_LOGI(TAG, "New SMS stored by modem (mem=%s, index=%d), reading it back.", mem, index);
+        push_pending_read(index);
+    } else {
+        ESP_LOGW(TAG, "Failed to parse +CMTI notification.");
+    }
+
+    cmti_ptr[urc_len] = temp_char;
+    return (cmti_ptr - urc_line_buffer) + urc_len;
+}
+
 static int handle_urc(char *urc_line_buffer) { // Now takes a mutable buffer
-    sms_message_t new_sms;
-    int urc_len = 0;
-
-    // Check for new SMS indication (+CMT:)
     char *cmt_ptr = strstr(urc_line_buffer, "+CMT:");
-    if (cmt_ptr) {
-        // Find the end of this specific +CMT URC block
-        char *first_crlf = strstr(cmt_ptr, "\r\n");
-        if (first_crlf) {
-            char *second_crlf = strstr(first_crlf + 2, "\r\n");
-            if (second_crlf) {
-                urc_len = (second_crlf - cmt_ptr) + 2; // Length from start of +CMT to end of second \r\n
+    char *cmti_ptr = strstr(urc_line_buffer, "+CMTI:");
 
-                // Temporarily null-terminate the URC block for parsing
-                char temp_char = cmt_ptr[urc_len];
-                cmt_ptr[urc_len] = '\0';
-
-                ESP_LOGI(TAG, "New SMS received (direct URC).");
-                esp_err_t parse_result = parse_cmt_pdu_response(cmt_ptr, &new_sms);
-
-                if (parse_result == ESP_OK) {
-                    // 完整SMS已组装完成,发送到队列
-                    if (s_sms_queue != NULL) {
-                        if (xQueueSend(s_sms_queue, &new_sms, portMAX_DELAY) != pdPASS) {
-                            ESP_LOGE(TAG, "Failed to send complete SMS to queue.");
-                        } else {
-                            ESP_LOGI(TAG, "Complete SMS sent to processing queue.");
-                        }
-                    }
-                } else if (parse_result == ESP_ERR_INVALID_STATE) {
-                    // 这是一个分段,已存储,等待更多分段
-                    ESP_LOGD(TAG, "SMS part processed, waiting for more parts.");
-                } else {
-                    ESP_LOGW(TAG, "Failed to parse SMS URC.");
-                }
-
-                cmt_ptr[urc_len] = temp_char; // Restore original char
-                return (cmt_ptr - urc_line_buffer) + urc_len; // Return total length processed from buffer start
-            }
-        }
+    // 缓冲区里可能同时躺着两种URC,先处理靠前的那条
+    if (cmt_ptr && (!cmti_ptr || cmt_ptr < cmti_ptr)) {
+        return handle_cmt_urc(urc_line_buffer, cmt_ptr);
+    }
+    if (cmti_ptr) {
+        return handle_cmti_urc(urc_line_buffer, cmti_ptr);
     }
     // Add other URC handlers here if needed (e.g., +CGATT, +CPIN)
-    // For this example, we only focus on +CMT
     return 0; // No complete URC processed
 }
 
