@@ -34,6 +34,7 @@ static QueueHandle_t s_uart_event_queue = NULL; // Declare event queue handle
 static char s_uart_rx_buffer[BUF_SIZE];
 static int s_uart_rx_buffer_idx = 0;
 static SemaphoreHandle_t s_uart_rx_mutex; // Mutex to protect rx_buffer access
+static bool s_at_command_pending = false; // Protected by s_uart_rx_mutex
 static TaskHandle_t s_uart_event_task_handle = NULL; // Task handle for cleanup
 static TaskHandle_t s_uart_at_task_handle = NULL; // Task handle for AT manager task
 
@@ -133,6 +134,34 @@ static const sim_operator_map_t s_operator_map[] = {
 static const size_t s_operator_map_size = sizeof(s_operator_map) / sizeof(s_operator_map[0]);
 
 
+// 空闲时只保留短信URC和最后一条未收完整的行。模组通常给普通URC加前导CRLF,
+// 旧逻辑逐行删除URC却留下这些分隔符,最终会慢性占满缓冲区。
+static void discard_idle_non_sms_data_locked(void) {
+    if (s_at_command_pending || s_uart_rx_buffer_idx == 0) {
+        return;
+    }
+
+    char *keep_start = strstr(s_uart_rx_buffer, "+CMT:");
+    char *cmti_start = strstr(s_uart_rx_buffer, "+CMTI:");
+    if (keep_start == NULL || (cmti_start != NULL && cmti_start < keep_start)) {
+        keep_start = cmti_start;
+    }
+
+    if (keep_start == NULL) {
+        keep_start = s_uart_rx_buffer;
+        char *line_end;
+        while ((line_end = strstr(keep_start, "\r\n")) != NULL) {
+            keep_start = line_end + 2;
+        }
+    }
+
+    size_t keep_len = s_uart_rx_buffer_idx - (size_t)(keep_start - s_uart_rx_buffer);
+    memmove(s_uart_rx_buffer, keep_start, keep_len);
+    s_uart_rx_buffer_idx = (int)keep_len;
+    s_uart_rx_buffer[s_uart_rx_buffer_idx] = '\0';
+}
+
+
 // UART event handler to collect data
 static void uart_event_task(void *pvParameters) {
     uart_event_t event;
@@ -150,22 +179,28 @@ static void uart_event_task(void *pvParameters) {
                     xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
                     int read_len = uart_read_bytes(UART_PORT_NUM, dtmp, event.size, portMAX_DELAY);
                     if (read_len > 0) {
+                        // 先回收空闲期残留,再判断容量,避免普通URC/空行慢性占满缓冲区。
+                        discard_idle_non_sms_data_locked();
+
                         // 检查是否会溢出
                         if (s_uart_rx_buffer_idx + read_len >= BUF_SIZE) {
                             ESP_LOGW(TAG, "UART RX buffer near overflow! Current: %d, Incoming: %d, Max: %d",
                                      s_uart_rx_buffer_idx, read_len, BUF_SIZE);
 
-                            // 尝试查找并保留+CMT消息,删除其他内容
-                            char *cmt_start = strstr(s_uart_rx_buffer, "+CMT:");
-                            if (cmt_start) {
-                                // 找到+CMT消息,保留它及之后的内容
-                                int keep_offset = cmt_start - s_uart_rx_buffer;
-                                ESP_LOGI(TAG, "Preserving +CMT message, discarding %d bytes before it", keep_offset);
-                                memmove(s_uart_rx_buffer, cmt_start, s_uart_rx_buffer_idx - keep_offset);
+                            // 极端情况下仍然溢出时,优先保留最早出现的短信URC。
+                            char *sms_start = strstr(s_uart_rx_buffer, "+CMT:");
+                            char *cmti_start = strstr(s_uart_rx_buffer, "+CMTI:");
+                            if (sms_start == NULL ||
+                                (cmti_start != NULL && cmti_start < sms_start)) {
+                                sms_start = cmti_start;
+                            }
+                            if (sms_start != NULL) {
+                                int keep_offset = sms_start - s_uart_rx_buffer;
+                                ESP_LOGI(TAG, "Preserving SMS URC, discarding %d bytes before it", keep_offset);
+                                memmove(s_uart_rx_buffer, sms_start, s_uart_rx_buffer_idx - keep_offset);
                                 s_uart_rx_buffer_idx -= keep_offset;
                             } else {
-                                // 没有+CMT消息,清空缓冲区以接收新数据
-                                ESP_LOGW(TAG, "No +CMT in buffer, clearing to make space");
+                                ESP_LOGW(TAG, "No SMS URC in buffer, clearing to make space");
                                 s_uart_rx_buffer_idx = 0;
                             }
                         }
@@ -187,64 +222,22 @@ static void uart_event_task(void *pvParameters) {
                         }
                         ESP_LOGD(TAG, "UART RX buffer updated (len=%d)", s_uart_rx_buffer_idx);
 
-                        // 清理非SMS相关的URC消息,避免缓冲区堆积
-                        // 保留AT命令响应、扩展错误响应和+CMT消息
-                        char *buffer_ptr = s_uart_rx_buffer;
-                        while (*buffer_ptr) {
-                            // 检查是否是需要忽略的URC (不是+CMT的其他URC)
-                            if (*buffer_ptr == '+' || *buffer_ptr == '^') {
-                                // +CME ERROR/+CMS ERROR是AT命令的终止响应，不是普通URC
-                                // +CMTI是模组把短信存进存储后的通知,必须保留:丢掉它
-                                // 等于丢掉整条短信,而且存储会一直涨到写满
-                                bool should_preserve_line = strncmp(buffer_ptr, "+CMT:", 5) == 0 ||
-                                                            strncmp(buffer_ptr, "+CMTI:", 6) == 0 ||
-                                                            strncmp(buffer_ptr, "+CME ERROR:", 11) == 0 ||
-                                                            strncmp(buffer_ptr, "+CMS ERROR:", 11) == 0;
-                                if (should_preserve_line) {
-                                    // 跳过这一行以保留它
-                                    char *line_end = strstr(buffer_ptr, "\r\n");
-                                    if (line_end) {
-                                        buffer_ptr = line_end + 2;
-                                    } else {
-                                        break; // 不完整的行,保留
-                                    }
-                                } else {
-                                    // 这是其他URC (如+CGEV, ^MODE, +NITZ等),需要删除
-                                    char *line_end = strstr(buffer_ptr, "\r\n");
-                                    if (line_end) {
-                                        int line_len = line_end + 2 - buffer_ptr;
-                                        ESP_LOGD(TAG, "Removing non-SMS URC (len=%d)", line_len);
-                                        // 移除这一行
-                                        memmove(buffer_ptr, line_end + 2, strlen(line_end + 2) + 1);
-                                        s_uart_rx_buffer_idx -= line_len;
-                                        // 不移动buffer_ptr,因为内容已经前移
-                                    } else {
-                                        break; // 不完整的行,保留
-                                    }
-                                }
-                            } else {
-                                // 不是URC,跳到下一行
-                                char *line_end = strstr(buffer_ptr, "\r\n");
-                                if (line_end) {
-                                    buffer_ptr = line_end + 2;
-                                } else {
-                                    break;
-                                }
+                        // Check for URCs or command responses in the buffer
+                        if (s_at_command_pending) {
+                            char *ok_pos = strstr(s_uart_rx_buffer, "OK\r\n");
+                            char *error_pos = strstr(s_uart_rx_buffer, "ERROR\r\n");
+                            char *cme_error_pos = strstr(s_uart_rx_buffer, "+CME ERROR:");
+                            char *cms_error_pos = strstr(s_uart_rx_buffer, "+CMS ERROR:");
+                            char *prompt_pos = strstr(s_uart_rx_buffer, "> "); // For CMGS prompt
+
+                            if (ok_pos) {
+                                xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_OK_BIT);
+                            } else if (error_pos || cme_error_pos || cms_error_pos || prompt_pos) {
+                                xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_ERROR_BIT);
                             }
                         }
 
-                        // Check for URCs or command responses in the buffer
-                        char *ok_pos = strstr(s_uart_rx_buffer, "OK\r\n");
-                        char *error_pos = strstr(s_uart_rx_buffer, "ERROR\r\n");
-                        char *cme_error_pos = strstr(s_uart_rx_buffer, "+CME ERROR:");
-                        char *cms_error_pos = strstr(s_uart_rx_buffer, "+CMS ERROR:");
-                        char *prompt_pos = strstr(s_uart_rx_buffer, "> "); // For CMGS prompt
-
-                        if (ok_pos) {
-                            xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_OK_BIT);
-                        } else if (error_pos || cme_error_pos || cms_error_pos || prompt_pos) {
-                            xEventGroupSetBits(s_at_response_event_group, AT_RESPONSE_ERROR_BIT);
-                        }
+                        discard_idle_non_sms_data_locked();
 
                         // Check for a complete incoming-SMS URC (+CMT block or +CMTI line)
                         if (has_complete_sms_urc_locked()) {
@@ -385,14 +378,15 @@ static void wait_for_recovery_retry(TickType_t delay_ticks) {
 static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t buffer_size, TickType_t timeout_ticks) {
     ESP_LOGD(TAG, "Sending AT command");
 
+    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT);
+
     xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
     // Process complete SMS reports first. If a report is still arriving, keep
     // it in the buffer instead of discarding it for the command transaction.
     process_pending_sms_urcs_locked();
     clear_command_data_preserving_sms_locked();
+    s_at_command_pending = true;
     xSemaphoreGive(s_uart_rx_mutex);
-
-    xEventGroupClearBits(s_at_response_event_group, AT_RESPONSE_OK_BIT | AT_RESPONSE_ERROR_BIT);
 
     uart_write_bytes(UART_PORT_NUM, cmd, strlen(cmd));
     uart_write_bytes(UART_PORT_NUM, "\r\n", 2); // AT commands usually end with CR+LF
@@ -406,6 +400,7 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
     xSemaphoreTake(s_uart_rx_mutex, portMAX_DELAY);
     strncpy(response_buffer, s_uart_rx_buffer, buffer_size - 1);
     response_buffer[buffer_size - 1] = '\0';
+    s_at_command_pending = false;
     process_pending_sms_urcs_locked();
     clear_command_data_preserving_sms_locked();
     xSemaphoreGive(s_uart_rx_mutex);
@@ -571,6 +566,7 @@ esp_err_t uart_at_init(QueueHandle_t sms_queue) {
     // Clear UART RX buffer
     s_uart_rx_buffer_idx = 0;
     s_uart_rx_buffer[0] = '\0';
+    s_at_command_pending = false;
 
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
