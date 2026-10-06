@@ -89,6 +89,7 @@ static esp_err_t at_send_command(const char *cmd, char *response_buffer, size_t 
 static esp_err_t configure_modem_for_sms(char *response_buffer, size_t buffer_size,
                                          bool *modem_responding);
 static void process_pending_sms_urcs(void);
+static void process_pending_sms_urcs_and_ack(void);
 static void wait_for_recovery_retry(TickType_t delay_ticks);
 static esp_err_t extract_and_dispatch_pdu(const char *response, const char *header);
 static void ack_direct_sms_if_pending(void);
@@ -358,7 +359,7 @@ static void wait_for_recovery_retry(TickType_t delay_ticks) {
                                                pdFALSE,
                                                remaining);
         if (bits & AT_RESPONSE_URC_BIT) {
-            process_pending_sms_urcs();
+            process_pending_sms_urcs_and_ack();
         } else {
             break;
         }
@@ -833,6 +834,12 @@ static void read_pending_stored_sms(void) {
     }
 }
 
+static void process_pending_sms_urcs_and_ack(void) {
+    // CMGF尚未配置成功时不能安全读取+CMTI；这里只处理会阻塞后续AT的直投确认。
+    process_pending_sms_urcs();
+    ack_direct_sms_if_pending();
+}
+
 /**
  * @brief 启动时取出并清空模组存储里积压的短信
  *
@@ -910,7 +917,7 @@ void uart_at_task(void *pvParameters) {
 
     // A modem that survived an ESP32 restart may already be reporting SMS.
     // Drain those reports before sending wake-up or validation commands.
-    process_pending_sms_urcs();
+    process_pending_sms_urcs_and_ack();
 
     // Send wake-up sequence to ensure modem is responsive
     // This is important when ESP32 restarts but modem is still running
@@ -921,12 +928,15 @@ void uart_at_task(void *pvParameters) {
     }
 
     vTaskDelay(pdMS_TO_TICKS(500));
-    process_pending_sms_urcs();
+    process_pending_sms_urcs_and_ack();
     ESP_LOGI(TAG, "Wake-up sequence complete, modem should be responsive.");
 
     bool modem_responding = false;
     while (configure_modem_for_sms(response_buffer, sizeof(response_buffer),
                                    &modem_responding) != ESP_OK) {
+        // 初始化期间到达的短信可能让模组等待AT+CNMA；先完成待办再重试AT。
+        process_pending_sms_urcs_and_ack();
+
         if (modem_responding) {
             // Communication recovered; restart the backoff for any remaining
             // SMS configuration failure.
@@ -946,7 +956,7 @@ void uart_at_task(void *pvParameters) {
         }
     }
 
-    process_pending_sms_urcs();
+    process_pending_sms_urcs_and_ack();
     ESP_LOGI(TAG, "4G modem initialization complete. Operator: %s", g_sim_operator);
 
     // 取走上次运行期间被存进模组、从未投递出去的短信,并腾空存储
